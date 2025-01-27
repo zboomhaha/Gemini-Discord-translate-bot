@@ -5,9 +5,8 @@
 <div align="center">
     <a href="https://github.com/zboomhaha/Walmart-Papago/blob/main/README-EN.md">English</a>
 </div>
+.<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737972141929_ezgif-7-2bcd85fa0a55_1.gif" width="700" /></div>
 <br>
-
-
 ## 📄**项目简介**
 
 Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，能够实时翻译指定频道里的文本、图像、embed消息。<br>适应Discord特性，分段返回原文、翻译和注释，方便复制粘贴。
