@@ -1,11 +1,11 @@
-.<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737963243834_walmart_papago_logo.png" width="200" height="200" /></div>
+<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737963243834_walmart_papago_logo.png" width="200" height="200" /></div>
 <div align="center">
 <h1><strong>Walmart Papago Discord translation bot</strong></h1>
 </div>
 <div align="center">
     <a href="https://github.com/zboomhaha/Walmart-Papago/blob/main/README-EN.md">English</a>
 </div>
-.<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737972141929_ezgif-7-2bcd85fa0a55_1.gif" width="700" /></div>
+<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737972141929_ezgif-7-2bcd85fa0a55_1.gif" width="700" /></div>
 <br>
 ## 📄**项目简介**
 
