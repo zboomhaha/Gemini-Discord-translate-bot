@@ -1,0 +1,7 @@
+     # Python 忽略规则
+     __pycache__/
+     *.py[cod]
+     *.env
+     *.sqlite3
+     *.db
+     logs/

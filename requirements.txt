@@ -1,0 +1,11 @@
+discord.py
+google-generativeai
+python-dotenv
+aiohttp
+grpcio==1.67.1
+protobuf
+Pillow
+numpy
+typing-extensions
+requests
+emoji
