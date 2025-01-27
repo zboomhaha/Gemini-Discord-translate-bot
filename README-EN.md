@@ -2,6 +2,9 @@
 <div align="center">
 <h1><strong>Walmart Papago Discord Translation Bot</strong></h1>
 </div>
+<div align="center">
+    <a href="https://github.com/zboomhaha/Walmart-Papago/blob/main/README.md">中文</a>
+</div>
 <br>
 
 ## 📄**Introduction**
