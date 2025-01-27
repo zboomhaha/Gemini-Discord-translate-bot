@@ -1,7 +1,16 @@
-     # Python 忽略规则
-     __pycache__/
-     *.py[cod]
-     *.env
-     *.sqlite3
-     *.db
-     logs/
+# 编辑 .gitignore 文件
+echo "# 环境变量文件
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# 日志
+logs/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db" > .gitignore
