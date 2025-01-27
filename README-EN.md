@@ -6,6 +6,9 @@
     <a href="https://github.com/zboomhaha/Walmart-Papago/blob/main/README.md">中文</a>
 </div>
 <br>
+</div>
+<div align=center><img src="https://newjeansr-imgbed.pages.dev/file/1737972141929_ezgif-7-2bcd85fa0a55_1.gif" width="700" /></div>
+<br>
 
 ## 📄**Introduction**
 
