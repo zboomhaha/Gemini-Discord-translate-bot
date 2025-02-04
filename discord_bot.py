@@ -111,7 +111,7 @@ class TranslatorBot(commands.Bot):
         
         # setup logging format and get root logger
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO) 
+        root_logger.setLevel(logging.DEBUG) 
         
         # Clear all existing handlers
         for handler in root_logger.handlers[:]:
@@ -721,17 +721,29 @@ class TranslatorBot(commands.Bot):
                         sent_message = await channel.send(content=part)
                         self.logger.info(f"Sent message part to channel {channel.name}: {part[:100]}...")
 
-            # If there are notes, send them separately at the end
+            # If there are notes, process them line by line
             if notes and not self._is_notes_empty(notes):
                 # Remove possible "Notes: " prefix
                 cleaned_notes = notes
                 if cleaned_notes.startswith("Notes: "):
                     cleaned_notes = cleaned_notes[7:]  # Remove "Notes: " prefix
-                # Send notes title first
-                await channel.send(content=titles["notes"])
-                # Then send notes content (without Notes: prefix)
-                sent_message = await channel.send(f"*{cleaned_notes}*")
-                self.logger.info(f"Sent notes to channel {channel.name}: {cleaned_notes}")
+                    
+                # Process notes line by line
+                valid_notes = []
+                for line in cleaned_notes.split('\n'):
+                    line = line.strip()
+                    if line and not self._is_notes_empty(line, check_line=True):
+                        # 如果行以 * 开头，保留原格式，否则添加 *
+                        if not line.startswith('*'):
+                            line = f"* {line}"
+                        valid_notes.append(line)
+                        
+                if valid_notes:  # Only send if there are valid notes
+                    # Send notes title first
+                    await channel.send(content=titles["notes"])
+                    # Then send filtered notes content without additional asterisks
+                    sent_message = await channel.send(chr(10).join(valid_notes))
+                    self.logger.info(f"Sent filtered notes to channel {channel.name}")
 
         except discord.errors.HTTPException as e:
             if e.code == 50035:  # Message length error
@@ -1296,7 +1308,7 @@ class TranslatorBot(commands.Bot):
         # All components are special content
         return True
 
-    def _is_notes_empty(self, notes: str) -> bool:
+    def _is_notes_empty(self, notes: str, check_line: bool = False) -> bool:
         """Check if notes are empty or meaningless"""
         # Check if it's None or empty string
         if not notes:
