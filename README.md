@@ -23,13 +23,13 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 
 ### **2. 智能内容处理**
 
-- **多格式内容解析：** 支持`普通文本`、`附件图片`、`Embed` 、`引用消息`等多种内容格式的翻译。（处理引用消息时，bot需要拥有读取该消息源频道的权限）
+- **多格式内容解析：** 支持`普通文本`、`附件图片`、`Embed` 、`引用消息`、`FxTwitter`等多种内容格式的翻译。（处理引用消息时，bot需要拥有读取该消息源频道的权限）
 - **内容预过滤：** 预过滤仅包含Emoji/Discord自定义表情/中英标点符号/纯数字/空内容的自然行，避免输出多余的翻译内容。
 - **自动包裹URL：** 自动识别并使用```包裹URL，避免FIX-URL类的Discord Bot重复识别URL并展开URL内容。
 
 ### **3. 负载均衡优化**
 
-- **双模型自动切换：** 主模型`gemini-2.0-flash-exp`失败时自动切换到备用模型`gemini-1.5-flash`。
+- **双模型自动切换：** 主模型`gemini-2.5-flash`失败时自动切换到备用模型`gemini-2.0-flash`。
 - **智能速率限制：** 随机轮换多个API 密钥、内置请求速率限制与重试策略，避免429。
 - **自适应并发控制：** 内置消息去重与缓存机制，异步消息队列可确保频道内的Discord消息按发送顺序处理。
 - **自动轮转和清理日志：** 日志文件每日自动轮转，自动清理超过7天的日志记录。
@@ -71,19 +71,25 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
     DISCORD_TOKEN=MAAAAAAA.GBBBBBBB.RCCCCCCCCCCCCCCCCCCCCCCCC-ng
           
     #Gemini API key,可以只填一个
-    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....      
+    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....
 
     #接收错误通知的Webhook URL
-    ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR      
+    ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR
 
     #接收错误通知的频道ID
-    ERROR_CHANNEL_ID=0000000000000000000      
-
-    #接收错误通知的用户ID
-    ERROR_NOTIFY_USER_ID=0000000000000000000      
+    ERROR_CHANNEL_ID=0000000000000000000
 
     #默认语言，随便写，默认zh-CN
-    DEFAULT_TARGET_LANG=zh-CN      
+    DEFAULT_TARGET_LANG=zh-CN
+
+    #日志等级配置
+    #LOG_LEVEL_ROOT: 全局日志等级 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    #LOG_LEVEL_FILE: 文件日志等级
+    #LOG_LEVEL_CONSOLE: 控制台日志等级
+    
+    LOG_LEVEL_ROOT=INFO
+    LOG_LEVEL_FILE=INFO
+    LOG_LEVEL_CONSOLE=INFO
     ```
     
 - **运行bot**
@@ -92,6 +98,10 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
     python3 discord_bot.py
     ```
     
+
+- **升级已有bot**
+
+    在停用bot之后，使用`pip install -r requirements.txt`重新安装依赖库后重启bot即可使用。
 
 ## 📔**使用指南**
 

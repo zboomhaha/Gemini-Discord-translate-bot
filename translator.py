@@ -1,14 +1,15 @@
 import logging
-import base64
 import io
 import aiohttp
 import json
 import random
 import asyncio
-import google.generativeai as genai
+import functools
+from google import genai
+from google.genai import types
 from asyncio import Semaphore
 from typing import Dict, Optional, List
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image
 from config import GEMINI_API_KEYS, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAULT_TARGET_LANG, IMAGE_TRANSLATION_PROMPT, EMPTY_INDICATORS
 
 class Translator:
@@ -36,93 +37,55 @@ class Translator:
         self.max_retries = 3  
 
     def setup_models(self):
-        """Initialize Gemini models, try available API keys in order"""    
+        """Initialize Gemini models, try available API keys in order"""
         
-        # Define function calling tools
-        self.tools = [{
-            "function_declarations": [{
-                "name": "extract_text_from_image",
-                "description": "Extract text from an image and check if it only contains emojis.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "image_data": {
-                            "type": "string",
-                            "description": "The image data in bytes format"
-                        }
-                    },
-                    "required": ["image_data"]
-                }
-            }, {
-                "name": "translate_text",
-                "description": "Translate text to target language.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Text to translate"
-                        },
-                        "target_lang": {
-                            "type": "string",
-                            "description": "Target language code"
-                        }
-                    },
-                    "required": ["text", "target_lang"]
-                }
-            }]
-        }]
 
-        # Add function calling configuration
-        self.tool_config = {
-            "function_calling_config": {
-                "mode": "AUTO"  # Use default AUTO mode
-            }
-        }
+        # Convert safety settings from config to the required type
+        self.safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory[setting["category"]],
+                threshold=types.HarmBlockThreshold[setting["threshold"]],
+            )
+            for setting in SAFETY_SETTINGS
+        ]
 
         try:
-            # Record initialization attempts
             initialization_errors = []
-            
-            # Define model configuration
-            model_config = {
-                'tools': self.tools
-            }
-            
-            # Try each key in order
             for key in self.api_keys:
                 try:
-                    genai.configure(api_key=key)
+                    # Initialize the client with the current key
+                    client = genai.Client(api_key=key)
                     
-                    # Test if key is available
-                    test_model = genai.GenerativeModel('models/gemini-1.5-flash', **model_config)
-                    
-                    response = test_model.generate_content(
-                        "Test connection.",
-                        safety_settings=SAFETY_SETTINGS
+                    # Test if the key is available by making a simple call
+                    test_response = client.models.generate_content(
+                        model="models/gemini-2.0-flash",
+                        contents=["Test connection."],
+                        config=types.GenerateContentConfig(
+                            safety_settings=self.safety_settings
+                        )
                     )
+
+                    # If successful, set model names and confirm initialization
+                    self.main_model_name = 'gemini-2.5-flash'
+                    self.fallback_model_name = 'gemini-2.0-flash'
                     
-                    # If successful, initialize main and fallback models
-                    self.main_model = genai.GenerativeModel('models/gemini-2.0-flash-exp', **model_config)
-                    self.fallback_model = genai.GenerativeModel('models/gemini-1.5-flash', **model_config)
-                    
-                    self.logger.info(f"Models initialized successfully with API key")
+                    self.logger.info(f"API key pool validated successfully.")
                     return
                     
                 except Exception as e:
-                    error_msg = f"Failed to initialize with key: {str(e)}"
+                    error_msg = f"Failed to initialize with a key: {str(e)}"
                     initialization_errors.append(error_msg)
                     self.logger.warning(error_msg)
                     continue
             
             # If all keys fail
             error_details = "\n".join(initialization_errors)
-            error_msg = f"Failed to initialize models with any API key. Errors:\n{error_details}"
+            error_msg = f"Failed to initialize client with any API key. Errors:\n{error_details}"
             self.logger.error(error_msg)
             raise Exception(error_msg)
-            
+
         except Exception as e:
-            self.logger.error(f"Failed to initialize models: {str(e)}")
+            self.logger.error(f"Failed to set up models: {str(e)}")
             raise
 
     def load_translation_dictionary(self):
@@ -248,14 +211,14 @@ class Translator:
             
             async with aiohttp.ClientSession() as session:
                 # Try main model
-                result = await self._try_model(self.main_model, prompt)
+                result = await self._try_model(self.main_model_name, prompt)
                 
                 if result:
                     return result
                 
                 # If main model fails, try fallback model
                 self.logger.warning("Primary model failed, switching to fallback model")
-                result = await self._try_model(self.fallback_model, prompt)
+                result = await self._try_model(self.fallback_model_name, prompt)
                 
                 if result:
                     return result
@@ -287,16 +250,20 @@ class Translator:
                     glossary_rules=self._build_glossary_prompt(),
                     skip_keywords=", ".join(self.skip_keywords)
                 )
-                image_part = await self._prepare_image_data(image)
+                # Convert image to bytes and prepare for API
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=95)
+                image_bytes = buffer.getvalue()
+                image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg')
                 
                 # 3. Try main model
-                result = await self._try_model(self.main_model, prompt, additional_data=image_part)
+                result = await self._try_model(self.main_model_name, prompt, additional_data=image_part)
                 if result:
                     return result
                 
                 # 4. Try fallback model
                 self.logger.info("Primary model failed, trying fallback model")
-                result = await self._try_model(self.fallback_model, prompt, additional_data=image_part)
+                result = await self._try_model(self.fallback_model_name, prompt, additional_data=image_part)
                 
                 if result:
                     return result
@@ -327,76 +294,80 @@ class Translator:
             self.logger.error(f"Failed to download and process image: {str(e)}")
             raise
 
-    async def _prepare_image_data(self, image: Image.Image) -> dict:
-        """Prepare image data"""
-        buffer = io.BytesIO()
-        image.save(buffer, format='JPEG', quality=95)
-        image_bytes = buffer.getvalue()
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        return {
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": image_b64
-            }
-        }
-
-    async def _try_model(self, model, prompt: str, additional_data: Optional[dict] = None) -> Optional[Dict]:
+    async def _try_model(self, model_name: str, prompt: str, additional_data: Optional[types.Part] = None) -> Optional[Dict]:
         """Generic model attempt method"""
         try:
-            self.logger.info(f"Attempting translation with model: {model.model_name}")
+            self.logger.info(f"Attempting translation with model: {model_name}")
             if additional_data:
-                self.logger.debug(f"Sending additional data: {additional_data}...")
-            
-            # Adjust safety settings based on model
-            current_safety_settings = SAFETY_SETTINGS
+                self.logger.debug(f"Sending additional data...")
 
-            async def generate_content():
-                if additional_data:
-                    return await model.generate_content_async(
-                        [prompt, additional_data],
-                        safety_settings=current_safety_settings,
-                        generation_config=genai.types.GenerationConfig(
-                            candidate_count=1,
-                            temperature=1,
-                            top_p=0.95,
-                            top_k=40,
-                            max_output_tokens=8192,
-                        )
+            # Set temperature and base generation config
+            gen_config_params = {}
+            if additional_data:
+                gen_config_params.update({
+                    "candidate_count": 1,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                })
+            else:
+                gen_config_params.update({
+                    "candidate_count": 1,
+                    "temperature": 1.2,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                })
+
+            # Prepare contents
+            contents = [prompt, additional_data] if additional_data else [prompt]
+
+            async def generate_content_call(client):
+                # Specific config for gemini-2.5-flash
+                if model_name == 'gemini-2.5-flash':
+                    config = types.GenerateContentConfig(
+                        **gen_config_params,
+                        safety_settings=self.safety_settings,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0)
                     )
                 else:
-                    return await model.generate_content_async(
-                        prompt,
-                        safety_settings=current_safety_settings,
-                        generation_config=genai.types.GenerationConfig(
-                            candidate_count=1,
-                            temperature=1.2,
-                            top_p=0.95,
-                            top_k=40,
-                            max_output_tokens=8192,
-                        )
+                    # For other models, do not include thinking_config
+                    config = types.GenerateContentConfig(
+                        **gen_config_params,
+                        safety_settings=self.safety_settings
                     )
-            
-            response = await self._rate_limited_request(generate_content)
-            
+
+                partial_func = functools.partial(
+                    client.models.generate_content,
+                    model=f"models/{model_name}",
+                    contents=contents,
+                    config=config
+                )
+                
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, partial_func)
+
+            response = await self._rate_limited_request(generate_content_call)
+
             # Add raw response log
             self.logger.debug(f"Raw Gemini response: {response}")
-            
-            if response.prompt_feedback.block_reason:
+
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
                 self.logger.warning(
                     f"Translation blocked: {response.prompt_feedback.block_reason}, "
-                    f"Model: {model.model_name}, "
+                    f"Model: {model_name}, "
                     f"Full feedback: {response.prompt_feedback}"
                 )
                 return None
-            
+
             result_text = response.text if hasattr(response, 'text') else str(response)
-            self.logger.info(f"Translation successful with model: {model.model_name}")
+            self.logger.info(f"Translation successful with model: {model_name}")
             return self._parse_translation_response(result_text, is_image=bool(additional_data))
-        
+
         except Exception as e:
             self.logger.error(
-                f"Model translation failed: {str(e)}，模型: {model.model_name}",
+                f"Model translation failed: {str(e)}，模型: {model_name}",
                 exc_info=True
             )
             return None
@@ -420,11 +391,9 @@ class Translator:
                 while available_keys:
                     selected_key = random.choice(available_keys)
                     try:
-                        genai.configure(api_key=selected_key)
-                        
+                        request_client = genai.Client(api_key=selected_key)
                         self.last_request_time = asyncio.get_running_loop().time()
-                        
-                        return await coro_func()
+                        return await coro_func(client=request_client)
     
                     except Exception as e:
                         last_error = e

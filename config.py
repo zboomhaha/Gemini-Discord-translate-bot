@@ -18,11 +18,27 @@ class Config:
             self._load_config()
             self._initialized = True
     
+    def _get_logging_level(self, level_name, default_level=logging.INFO):
+        """Converts a string level name to a logging level."""
+        level = getattr(logging, str(level_name).upper(), default_level)
+        return level
+
     def _load_config(self):
         try:
-            # Configure logging
+            # --- Logging Configuration ---
+            self.LOG_LEVEL_ROOT = self._get_logging_level(os.getenv('LOG_LEVEL_ROOT', 'INFO'), logging.INFO)
+            self.LOG_LEVEL_FILE = self._get_logging_level(os.getenv('LOG_LEVEL_FILE', 'INFO'), logging.INFO)
+            self.LOG_LEVEL_CONSOLE = self._get_logging_level(os.getenv('LOG_LEVEL_CONSOLE', 'INFO'), logging.INFO)
+            
+            # Basic configuration to ensure logging is captured before bot's setup
+            # Remove any existing handlers from the root logger to ensure our config is applied
+            root_logger = logging.getLogger()
+            if root_logger.hasHandlers():
+                for handler in root_logger.handlers[:]:
+                    root_logger.removeHandler(handler)
+            
             logging.basicConfig(
-                level=logging.INFO,
+                level=self.LOG_LEVEL_ROOT,
                 format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             )
             logger = logging.getLogger(__name__)
@@ -39,7 +55,6 @@ class Config:
             
             self.ERROR_WEBHOOK_URL = os.getenv('ERROR_WEBHOOK_URL')
             self.ERROR_CHANNEL_ID = int(os.getenv('ERROR_CHANNEL_ID', '0'))
-            self.ERROR_NOTIFY_USER_ID = int(os.getenv('ERROR_NOTIFY_USER_ID'))
             
             # Gemini configuration
             logger.info("Loading Gemini configuration...")
@@ -182,20 +197,17 @@ Task Requirements:
 '''
 
             # Empty content indicators configuration
-            self.EMPTY_CONTENT_INDICATORS = {
-                "common": [
-                    "none", "null", "nil", "empty", "-", "",
-                    "na", "notext", "nocontent", "notdetected", "noresult"
-                ],
-                "chinese": [
-                    "无", "空", "空白", "无内容", "没有", "没有内容", "未检测到"
-                ]
-            }
-
-            # Flatten the indicators for simple lookup
             self.EMPTY_INDICATORS = [
-                indicator.lower() 
-                for category in self.EMPTY_CONTENT_INDICATORS.values() 
+                indicator.lower()
+                for category in {
+                    "common": [
+                        "none", "null", "nil", "empty", "-", "",
+                        "na", "notext", "nocontent", "notdetected", "noresult"
+                    ],
+                    "chinese": [
+                        "无", "空", "空白", "无内容", "没有", "没有内容", "未检测到"
+                    ]
+                }.values()
                 for indicator in category
             ]
 
@@ -211,12 +223,13 @@ config = Config()
 DISCORD_TOKEN = config.DISCORD_TOKEN
 ERROR_WEBHOOK_URL = config.ERROR_WEBHOOK_URL
 ERROR_CHANNEL_ID = config.ERROR_CHANNEL_ID
-ERROR_NOTIFY_USER_ID = config.ERROR_NOTIFY_USER_ID
 TRANSLATION_COOLDOWN = config.TRANSLATION_COOLDOWN
 DEFAULT_TARGET_LANG = config.DEFAULT_TARGET_LANG
 SAFETY_SETTINGS = config.SAFETY_SETTINGS
 TRANSLATION_PROMPT = config.TRANSLATION_PROMPT
 IMAGE_TRANSLATION_PROMPT = config.IMAGE_TRANSLATION_PROMPT
 GEMINI_API_KEYS = config.GEMINI_API_KEYS
-EMPTY_CONTENT_INDICATORS = config.EMPTY_CONTENT_INDICATORS
 EMPTY_INDICATORS = config.EMPTY_INDICATORS
+LOG_LEVEL_ROOT = config.LOG_LEVEL_ROOT
+LOG_LEVEL_FILE = config.LOG_LEVEL_FILE
+LOG_LEVEL_CONSOLE = config.LOG_LEVEL_CONSOLE

@@ -1,8 +1,8 @@
 discord.py
-google-generativeai
+google-genai
 python-dotenv
 aiohttp
-grpcio==1.67.1
+grpcio
 protobuf
 Pillow
 numpy

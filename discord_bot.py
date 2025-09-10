@@ -12,12 +12,15 @@ import emoji
 import functools
 import discord
 from discord import app_commands, Interaction
-from discord.ext import commands, tasks
+from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import Optional
 from translator import Translator
-from config import Config, DISCORD_TOKEN, ERROR_WEBHOOK_URL, ERROR_CHANNEL_ID, EMPTY_INDICATORS
+from config import (
+    Config, DISCORD_TOKEN, ERROR_WEBHOOK_URL, ERROR_CHANNEL_ID, EMPTY_INDICATORS,
+    LOG_LEVEL_ROOT, LOG_LEVEL_FILE, LOG_LEVEL_CONSOLE
+)
 from logging.handlers import TimedRotatingFileHandler
 
 
@@ -38,7 +41,6 @@ class TranslatorBot(commands.Bot):
         # Initialize Discord bot
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True  # 添加members intent以获取服务器成员列表
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -86,10 +88,6 @@ class TranslatorBot(commands.Bot):
         self.blocked_users_file = 'blocked_users.json'
         self.blocked_users = self.load_blocked_users()
         
-        # Add DM whitelist file path and data
-        self.dm_whitelist_file = 'dm_whitelist.json'
-        self.dm_whitelist = self.load_dm_whitelist()
-        
         # Add regex patterns as class properties
         self.discord_emoji_pattern = r'<a?:\w+:\d+>'  # Discord custom emojis
         self.url_pattern = r'https?://[^\s<>[\]]+[^\s.,<>[\]]'  # URLs
@@ -100,10 +98,6 @@ class TranslatorBot(commands.Bot):
             'japanese': r'[\u3040-\u309F\u30A0-\u30FF]',
             'korean': r'[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]'
         }      
-        
-        # create a list to store all commands, for on_ready use
-        self.command_list = []
-        
         # Add signal handler
         signal.signal(signal.SIGINT, self.handle_exit)
         signal.signal(signal.SIGTERM, self.handle_exit)
@@ -120,7 +114,7 @@ class TranslatorBot(commands.Bot):
         
         # setup logging format and get root logger
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.DEBUG) 
+        root_logger.setLevel(LOG_LEVEL_ROOT)
         
         # Clear all existing handlers
         for handler in root_logger.handlers[:]:
@@ -135,7 +129,7 @@ class TranslatorBot(commands.Bot):
             backupCount=7,  # keep 7 days of logs
             encoding='utf-8'
         )
-        file_handler.setLevel(logging.INFO)  # Ensure file handler uses INFO level
+        file_handler.setLevel(LOG_LEVEL_FILE)  # Ensure file handler uses INFO level
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
@@ -143,7 +137,7 @@ class TranslatorBot(commands.Bot):
         
         # Setup console handler
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG)  # Show debug level in console
+        console_handler.setLevel(LOG_LEVEL_CONSOLE)  # Show debug level in console
         console_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
@@ -153,6 +147,7 @@ class TranslatorBot(commands.Bot):
         self.logger = logging.getLogger(__name__)
         
     async def setup_hook(self):
+
         try:
             # Initialize message queue and lock    
             self.message_queue = asyncio.Queue()
@@ -165,123 +160,84 @@ class TranslatorBot(commands.Bot):
             self.cleanup_task = self.loop.create_task(self._cleanup_messages())
             self.logger.info("Initialized setup hook.")           
             
-            async def set_translation_channel_callback(interaction: discord.Interaction, target_channel: discord.TextChannel = None):
-                return await self.set_translation_channel(interaction, target_channel)
-            
-            async def remove_translation_channel_callback(interaction: discord.Interaction):
-                return await self.remove_translation_channel(interaction)
-            
-            async def list_translation_channels_callback(interaction: discord.Interaction):
-                return await self.list_translation_channels(interaction)
-            
-            async def block_user_callback(interaction: discord.Interaction, user: discord.User):
-                return await self.block_user(interaction, user)
-            
-            async def unblock_user_callback(interaction: discord.Interaction, user: discord.User):
-                return await self.unblock_user(interaction, user)
-            
-            async def block_webhook_callback(interaction: discord.Interaction, webhook_id: str):
-                return await self.block_webhook(interaction, webhook_id)
-            
-            async def unblock_webhook_callback(interaction: discord.Interaction, webhook_id: str):
-                return await self.unblock_webhook(interaction, webhook_id)
-            
-            async def list_blocks_callback(interaction: discord.Interaction):
-                return await self.list_blocks(interaction)
-            
-            async def add_glossary_term_callback(interaction: discord.Interaction, original: str, translation: str):
-                return await self.add_glossary_term(interaction, original, translation)
-            
-            async def remove_glossary_term_callback(interaction: discord.Interaction, original: str):
-                return await self.remove_glossary_term(interaction, original)
-            
-            async def list_glossary_callback(interaction: discord.Interaction):
-                return await self.list_glossary(interaction)
-            
-            async def add_skip_keyword_callback(interaction: discord.Interaction, keyword: str):
-                return await self.add_skip_keyword(interaction, keyword)
-            
-            async def remove_skip_keyword_callback(interaction: discord.Interaction, keyword: str):
-                return await self.remove_skip_keyword(interaction, keyword)
-            
-            async def list_skip_keywords_callback(interaction: discord.Interaction):
-                return await self.list_skip_keywords(interaction)
-            
-            # save all commands to command list, not add to command tree directly
-            self.command_list = [
+            # Register all commands
+            # 1. Translation channel management commands
+            for cmd in [
                 app_commands.Command(
                     name="set_translation_channel",
                     description="Set current channel as translation channel",
-                    callback=set_translation_channel_callback
+                    callback=self.set_translation_channel
                 ),
                 app_commands.Command(
                     name="remove_translation_channel",
                     description="Remove translation feature from current channel",
-                    callback=remove_translation_channel_callback
+                    callback=self.remove_translation_channel
                 ),
                 app_commands.Command(
                     name="list_translation_channels",
                     description="List all translation channel mappings",
-                    callback=list_translation_channels_callback
+                    callback=self.list_translation_channels
                 ),
                 app_commands.Command(
                     name="block_user",
                     description="Block message translation for specified user/bot",
-                    callback=block_user_callback
+                    callback=self.block_user
                 ),
                 app_commands.Command(
                     name="unblock_user",
                     description="Unblock message translation for specified user/bot",
-                    callback=unblock_user_callback
+                    callback=self.unblock_user
                 ),
                 app_commands.Command(
                     name="block_webhook",
                     description="Block webhook",
-                    callback=block_webhook_callback
+                    callback=self.block_webhook
                 ),
                 app_commands.Command(
                     name="unblock_webhook",
                     description="Unblock webhook",
-                    callback=unblock_webhook_callback
+                    callback=self.unblock_webhook
                 ),
                 app_commands.Command(
                     name="list_blocks",
                     description="List all blocked users/bots/webhooks",
-                    callback=list_blocks_callback
+                    callback=self.list_blocks
                 ),
                 app_commands.Command(
                     name="add_glossary_term",
                     description="Add glossary term",
-                    callback=add_glossary_term_callback
+                    callback=self.add_glossary_term
                 ),
                 app_commands.Command(
                     name="remove_glossary_term",
                     description="Remove glossary term",
-                    callback=remove_glossary_term_callback
+                    callback=self.remove_glossary_term
                 ),
                 app_commands.Command(
                     name="list_glossary",
                     description="List all glossary terms",
-                    callback=list_glossary_callback
+                    callback=self.list_glossary
                 ),
                 app_commands.Command(
                     name="add_skip_keyword",
                     description="Add a skip keyword",
-                    callback=add_skip_keyword_callback
+                    callback=self.add_skip_keyword
                 ),
                 app_commands.Command(
                     name="remove_skip_keyword",
                     description="Remove a skip keyword",
-                    callback=remove_skip_keyword_callback
+                    callback=self.remove_skip_keyword
                 ),
                 app_commands.Command(
                     name="list_skip_keywords",
                     description="List all skip keywords",
-                    callback=list_skip_keywords_callback
+                    callback=self.list_skip_keywords
                 ),
-            ]
-            
-            self.logger.info("All commands prepared. Will register and sync after bot is ready.")
+            ]:
+                self.tree.add_command(cmd)
+
+            await self.tree.sync(guild=None) 
+            self.logger.info("All commands registered and synced.")
             
             # Start message processing task
             if self.message_processor_task is None:
@@ -294,7 +250,7 @@ class TranslatorBot(commands.Bot):
             # Connect info
             self._ready.set()
             self.logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
-               
+            
             # Finish setup notification
             self.logger.info("Bot setup completed.")
 
@@ -347,85 +303,6 @@ class TranslatorBot(commands.Bot):
         except Exception as e:
             self.logger.error(f"Failed to load blocked users: {str(e)}")
             return []  # Return empty list if error
-
-    def load_dm_whitelist(self):
-        """Load DM whitelist from file"""
-        try:
-            if os.path.exists(self.dm_whitelist_file):
-                with open(self.dm_whitelist_file, 'r') as f:
-                    return json.load(f)
-            # If file doesn't exist, create default empty list
-            default_data = {"auto_users": []}
-            with open(self.dm_whitelist_file, 'w') as f:
-                json.dump(default_data, f)
-            return default_data
-        except Exception as e:
-            self.logger.error(f"Failed to load DM whitelist: {str(e)}")
-            return {"auto_users": []}  # Return empty whitelist if error
-            
-    def save_dm_whitelist(self):
-        """Save DM whitelist to file"""
-        try:
-            with open(self.dm_whitelist_file, 'w') as f:
-                json.dump(self.dm_whitelist, f)
-        except Exception as e:
-            self.logger.error(f"Failed to save DM whitelist: {str(e)}")
-
-    @tasks.loop(hours=24) #task running interval
-    async def update_dm_whitelist_task(self): 
-        """Scheduled DM whitelist update"""
-        self.logger.info("Starting scheduled DM whitelist update...") 
-               
-        try:
-            current_users = set()
-            for guild in self.guilds:
-                if guild is None: 
-                    self.logger.warning(f"Skipping unavailable guild during whitelist update.")
-                    continue
-                self.logger.info(f"Processing guild for whitelist: {guild.name} (ID: {guild.id})")
-                try:
-                    async for member in guild.fetch_members(limit=None):
-                        if not member.bot: 
-                           current_users.add(str(member.id))
-                    self.logger.debug(f"Fetched members from {guild.name}. Current total unique users: {len(current_users)}")
-                except discord.errors.Forbidden:
-                    self.logger.error(f"Bot lacks permissions to fetch members from guild {guild.name} (ID: {guild.id})")
-                except discord.errors.HTTPException as http_err:
-                     self.logger.error(f"HTTP Error fetching members from guild {guild.name} (ID: {guild.id}): {http_err}")
-                except Exception as e:
-                    self.logger.error(f"Unexpected error fetching members from guild {guild.name} (ID: {guild.id}): {str(e)}", exc_info=True)
-            
-            if not hasattr(self, 'dm_whitelist') or not self.dm_whitelist:
-                self.dm_whitelist = self.load_dm_whitelist()
-            old_users = set(self.dm_whitelist.get('auto_users', []))
-            new_users_list = list(current_users) 
-            if set(new_users_list) != old_users:
-                old_count = len(old_users)
-                new_count = len(new_users_list)
-                self.dm_whitelist['auto_users'] = new_users_list 
-                added_users = current_users - old_users
-                removed_users = old_users - current_users
-                self.logger.info(f"DM whitelist updated - Old: {old_count} users, New: {new_count} users")
-                if added_users:
-                    self.logger.info(f"Added {len(added_users)} new users to DM whitelist.")
-                if removed_users:
-                    self.logger.info(f"Removed {len(removed_users)} users from DM whitelist.")
-                self.save_dm_whitelist()
-                self.logger.info(f"DM whitelist changes saved to {self.dm_whitelist_file}")
-            else:
-                self.logger.info("No changes detected in DM whitelist.") 
-        except Exception as e:
-            self.logger.error(f"Failed during scheduled DM whitelist update: {str(e)}", exc_info=True)
-
-    @update_dm_whitelist_task.before_loop 
-    async def before_update_dm_whitelist(self):
-        """Waiting for bot to be ready before starting whitelist update loop"""
-        self.logger.info('Bot is ready, starting whitelist update loop.')
-
-    def has_dm_permission(self, user_id):
-        """Check if user has permission to DM the bot"""
-        user_id_str = str(user_id)
-        return user_id_str in self.dm_whitelist.get('auto_users', [])
 
     def require_permissions(permission):
         """Decorator for permission checking"""
@@ -492,23 +369,9 @@ class TranslatorBot(commands.Bot):
     async def on_message(self, message):
         """Message reception processing"""
         try:
-            # Check Whether it is a message from the bot itself
+            # Check 1: Whether it is a message from the bot itself
             if message.author == self.user:
                 return
-                
-            # Check 1: Whether it is from DM channel
-            if isinstance(message.channel, discord.DMChannel):
-                # Check if user has permission to DM the bot
-                if not self.has_dm_permission(message.author.id):
-                    self.logger.warning(f"Unauthorized DM from user: {message.author} (ID: {message.author.id})")
-                    await message.reply("Sorry, you don't have permission to DM this bot.", mention_author=False)
-                    return
-                self.logger.info(f"Received DM from authorized user: {message.author} (ID: {message.author.id})")
-                
-                # process DM message - add to queue directly
-                await self.message_queue.put(message)
-                self.logger.info(f"DM message {message.id} added to queue")
-                return  
             
             # Check 2: Whether it is from source channel
             if message.channel.id not in self.translation_channels:
@@ -538,18 +401,6 @@ class TranslatorBot(commands.Bot):
                 if is_blocked:
                     self.logger.info(f"Skipping message from blocked user: {message.author}")
                     return
-
-            
-            # Check 6: Check if any mentioned user/bot is blocked
-            if message.mentions:
-                for mentioned_user in message.mentions:
-                    is_mention_blocked = any(
-                        block["id"] == mentioned_user.id and block["type"] in ["user", "bot"]
-                        for block in self.blocked_users
-                    )
-                    if is_mention_blocked:
-                        self.logger.info(f"Skipping message {message.id} because it mentions a blocked user/bot: {mentioned_user.name} ({mentioned_user.id})")
-                        return
                     
             # After passing all checks, add to queue
             await self.message_queue.put(message)
@@ -584,18 +435,10 @@ class TranslatorBot(commands.Bot):
     async def handle_message(self, message):
         """Message overall processing control and status recording"""
         self.logger.info(f"Start processing message: {message.id}")
-        message_processed = False  # Add processing status flag
+        message_processed = False
+        is_successful_run = False
         
         try:
-            # process DM message
-            if isinstance(message.channel, discord.DMChannel):
-                # use the same processing logic as server message, just target channel is DM channel
-                current_processed = await self.process_translated_content(message, message.channel, is_dm=True)
-                message_processed = current_processed
-                
-                return message_processed
-            
-            # process server message
             target_channel_id = self.translation_channels.get(message.channel.id)
             if not target_channel_id:
                 self.logger.error(f"No target channel ID configured for: {message.channel.id}")
@@ -614,14 +457,16 @@ class TranslatorBot(commands.Bot):
             referenced_message = await self.fetch_referenced_message(message)
             if referenced_message:
                 ref_processed = await self.process_translated_content(referenced_message, target_channel)
-                message_processed = message_processed or ref_processed  # update processing status
+                message_processed = message_processed or ref_processed
             
             # Process current message
             current_processed = await self.process_translated_content(message, target_channel)
-            message_processed = message_processed or current_processed  # Update processing status
+            message_processed = message_processed or current_processed
             
-            self.logger.info("Message processing completed")
-            return message_processed  # Return final processing status
+            is_successful_run = message_processed
+            if is_successful_run:
+                self.logger.info("Message processing completed")
+            return message_processed
         
         except Exception as e:
             self.logger.error(f"Error processing message: {str(e)}", exc_info=True)
@@ -630,105 +475,208 @@ class TranslatorBot(commands.Bot):
         
         finally:
             # Output corresponding logs based on processing status
-            self.logger.info(f"Message {message.id} processed {'successfully' if message_processed else 'failed'}")
+            if not is_successful_run:
+                status = "failed"
+            elif message_processed:
+                status = "successfully"
+            else:
+                status = "done"
+            self.logger.info(f"Message {message.id} processed {status}")
             self.logger.info(f"End processing message: {message.id}")
 
-    async def process_translated_content(self, message, target_channel, is_dm=False):
+    async def process_translated_content(self, message, target_channel):
         """Process specific message content, request translation and retrieve translation result"""
-        try:
-            success = False 
+        success = False
+
+        # Process normal text content
+        if message.content:
+            # Priority 1: Handle FxTwitter links
+            fxtwitter_pattern = r'https?://fxtwitter\.com/\S+'
+            fxtwitter_match = re.search(fxtwitter_pattern, message.content)
             
-            # Process normal text content
-            if message.content:
-                self.logger.info(f"Processing normal text content: {message.content[:100]}...")
-                processed_text = self.text_pre_check(message.content)
-                if processed_text:
-                    result = await self.translator.translate_text(processed_text)
-                    if isinstance(result, dict):
-                        await self.send_translation_result(
-                            target_channel,
-                            result.get("original"),
-                            result.get("translation"),
-                            notes=result.get("notes"),
-                            is_dm=is_dm
-                        )
-                    else:
-                        await self.send_translation_result(target_channel, processed_text, result, is_dm=is_dm)
-                    success = True  
+            if fxtwitter_match:
+                url = fxtwitter_match.group(0)
+                self.logger.info(f"Detected FxTwitter link: {url}")
+                
+                try:
+                    # Handle the link
+                    fxtwitter_processed = await self.handle_fxtwitter_link(url, target_channel)
+                    success = success or fxtwitter_processed
+                    
+                    # If FxTwitter link was processed, skip the rest of the text content
+                    if fxtwitter_processed:
+                        self.logger.info("FxTwitter link processed successfully, skipping further text processing.")
+                        return success # Return the current success status
 
-            # Process attachments
-            if message.attachments:
-                await self.handle_attachments(message.attachments, target_channel, is_dm=is_dm)
-                success = True  
+                except Exception as e:
+                    self.logger.error(f"Error handling FxTwitter link {url}: {e}", exc_info=True)
+                    # If the handler fails, we should not proceed to process the rest of the message
+                    # as if it were normal text, because it might misinterpret the content.
+                    return False # Indicate failure and stop processing this message content.
 
-            # Process embeds
-            for embed in message.embeds:
-                embed_success = False 
-                
-                if embed.title:                 
-                    processed_title = self.text_pre_check(embed.title)
-                    if processed_title:
-                        try:
-                            result = await self.translator.translate_text(processed_title)
-                            if isinstance(result, dict):
-                                await self.send_translation_result(
-                                    target_channel,
-                                    result.get("original"),
-                                    result.get("translation"),
-                                    notes=result.get("notes"),
-                                    is_dm=is_dm
-                                )
-                            else:
-                                await self.send_translation_result(target_channel, processed_title, result, is_dm=is_dm)
-                            self.logger.info("Embed title translation completed")
-                            embed_success = True
-                        except Exception as e:
-                            self.logger.error(f"Error translating embed title: {str(e)}", exc_info=True)
-                
-                if embed.description:
-                    processed_desc = self.text_pre_check(embed.description)
-                    if processed_desc:
-                        try:
-                            result = await self.translator.translate_text(processed_desc)
-                            if isinstance(result, dict):
-                                await self.send_translation_result(
-                                    target_channel,
-                                    result.get("original"),
-                                    result.get("translation"),
-                                    notes=result.get("notes"),
-                                    is_dm=is_dm
-                                )
-                            else:
-                                await self.send_translation_result(target_channel, processed_desc, result, is_dm=is_dm)
-                            self.logger.info("Embed description translation completed")
-                            embed_success = True
-                        except Exception as e:
-                            self.logger.error(f"Error translating embed description: {str(e)}", exc_info=True)
-                
-                if embed.image:
-                    self.logger.info(f"Processing embed image: {embed.image.url}")
+            # Priority 2: Process remaining text content after special handling
+            self.logger.info(f"Processing normal text content: {message.content[:100]}...")
+            processed_text = self.text_pre_check(message.content)
+            if processed_text:
+                result = await self.translator.translate_text(processed_text)
+                if isinstance(result, dict):
+                    await self.send_translation_result(
+                        target_channel,
+                        result.get("original"),
+                        result.get("translation"),
+                        notes=result.get("notes")
+                    )
+                else:
+                    await self.send_translation_result(target_channel, processed_text, result)
+                success = True
+
+        # Process attachments
+        if message.attachments:
+            await self.handle_attachments(message.attachments, target_channel)
+            success = True
+
+        # Process embeds
+        for embed in message.embeds:
+            embed_success = False
+
+            if embed.title:
+                processed_title = self.text_pre_check(embed.title)
+                if processed_title:
                     try:
-                        translated_image = await self.translator.translate_image(embed.image.url)
-                        if translated_image:
+                        result = await self.translator.translate_text(processed_title)
+                        if isinstance(result, dict):
                             await self.send_translation_result(
                                 target_channel,
-                                translated_image.get("original"),
-                                translated_image.get("translation"),
-                                notes=translated_image.get("notes"),
-                                image_url=embed.image.url,
-                                is_dm=is_dm
+                                result.get("original"),
+                                result.get("translation"),
+                                notes=result.get("notes")
                             )
-                            self.logger.info("Embed image translation completed")
-                            embed_success = True
+                        else:
+                            await self.send_translation_result(target_channel, processed_title, result)
+                        self.logger.info("Embed title translation completed")
+                        embed_success = True
                     except Exception as e:
-                        self.logger.error(f"Error processing embed image: {str(e)}", exc_info=True)
+                        self.logger.error(f"Error translating embed title: {str(e)}", exc_info=True)
+
+            if embed.description:
+                processed_desc = self.text_pre_check(embed.description)
+                if processed_desc:
+                    try:
+                        result = await self.translator.translate_text(processed_desc)
+                        if isinstance(result, dict):
+                            await self.send_translation_result(
+                                target_channel,
+                                result.get("original"),
+                                result.get("translation"),
+                                notes=result.get("notes")
+                            )
+                        else:
+                            await self.send_translation_result(target_channel, processed_desc, result)
+                        self.logger.info("Embed description translation completed")
+                        embed_success = True
+                    except Exception as e:
+                        self.logger.error(f"Error translating embed description: {str(e)}", exc_info=True)
+
+            if embed.image:
+                self.logger.info(f"Processing embed image: {embed.image.url}")
+                try:
+                    translated_image = await self.translator.translate_image(embed.image.url)
+                    if translated_image:
+                        await self.send_translation_result(
+                            target_channel,
+                            translated_image.get("original"),
+                            translated_image.get("translation"),
+                            notes=translated_image.get("notes"),
+                            image_url=embed.image.url
+                        )
+                        self.logger.info("Embed image translation completed")
+                        embed_success = True
+                except Exception as e:
+                    self.logger.error(f"Error processing embed image: {str(e)}", exc_info=True)
+
+            success = success or embed_success  # If any embed processing is successful, overall processing is successful
+
+        return success  # Return processing status
+
+    async def handle_fxtwitter_link(self, url, target_channel):
+        """Handle FxTwitter link by fetching JSON data from the api.fxtwitter.com endpoint."""
+        api_url = url.replace("fxtwitter.com", "api.fxtwitter.com")
+        self.logger.info(f"Requesting FxTwitter API: {api_url}")
+
+        try:
+            async with self.session.get(api_url) as response:
+                response.raise_for_status()  # Raise an exception for bad status codes
+                data = await response.json()
+                self.logger.debug(f"FxTwitter API response JSON: {json.dumps(data, indent=2)}")
+                self.logger.info("Successfully parsed JSON from FxTwitter API.")
+
+                tweet = data.get('tweet', {})
+                description = tweet.get('text')
+                media = tweet.get('media', {})
+                image_urls = []
+
+                # 1. Mixed media (videos first)
+                if media.get('videos'):
+                    for video in media['videos']:
+                        if video.get('thumbnail_url'):
+                            image_urls.append(video['thumbnail_url'])
+                # 2. Mosaic (multiple images)
+                elif media.get('mosaic') and media['mosaic'].get('formats', {}).get('jpeg'):
+                    image_urls.append(media['mosaic']['formats']['jpeg'])
+                # 3. Single photo
+                elif media.get('photos'):
+                    for photo in media['photos']:
+                        if photo.get('url'):
+                            image_urls.append(photo['url'])
+                # 4. External video link
+                elif media.get('external'):
+                    image_urls.append(media['external'].get('thumbnail_url'))
                 
-                success = success or embed_success  # If any embed processing is successful, overall processing is successful
+                # Filter out any None values from image_urls
+                image_urls = [url for url in image_urls if url]
 
-            return success  # Return processing status
+                success = False
+                if description:
+                    processed_desc = self.text_pre_check(description)
+                    if processed_desc:
+                        result = await self.translator.translate_text(processed_desc)
+                        if isinstance(result, dict):
+                            await self.send_translation_result(
+                                target_channel,
+                                result.get("original"),
+                                result.get("translation"),
+                                notes=result.get("notes")
+                            )
+                        else:
+                            await self.send_translation_result(target_channel, processed_desc, result)
+                        success = True
+                
+                for image_url in image_urls:
+                    self.logger.info(f"Processing image from FxTwitter: {image_url}")
+                    translated_image = await self.translator.translate_image(image_url)
+                    if translated_image:
+                        await self.send_translation_result(
+                            target_channel,
+                            translated_image.get("original"),
+                            translated_image.get("translation"),
+                            notes=translated_image.get("notes"),
+                            image_url=image_url
+                        )
+                        success = True
+                
+                return success
 
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Network error fetching FxTwitter API {api_url}: {e}", exc_info=True)
+            return False
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse JSON from FxTwitter API {api_url}: {e}", exc_info=True)
+            return False
+        except KeyError as e:
+            self.logger.error(f"Key error when parsing FxTwitter JSON from {api_url}: Missing key {e}", exc_info=True)
+            return False
         except Exception as e:
-            await self.handle_global_error(e, "translation")
+            self.logger.error(f"An unexpected error occurred while handling FxTwitter link {url}: {e}", exc_info=True)
             return False
 
     def text_pre_check(self, text: str) -> Optional[str]:
@@ -745,6 +693,8 @@ class TranslatorBot(commands.Bot):
                 # Skip empty lines
                 if not line.strip():
                     continue
+                
+                # 0. Clean FxTwitter social proof
                                     
                 # 1. Check if line contains keywords to be skipped
                 should_skip = False
@@ -792,9 +742,10 @@ class TranslatorBot(commands.Bot):
             self.logger.error(f"Error processing text: {str(e)}")
             return None
 
-    async def send_translation_result(self, channel, original, translated, notes=None, image_url=None, is_dm=False):
+    async def send_translation_result(self, channel, original, translated, notes=None, image_url=None):
         """Format and send translation result to Discord"""
         try:
+
             self.logger.info("Processing translation for sending")
             messages = []
 
@@ -877,37 +828,25 @@ class TranslatorBot(commands.Bot):
             for msg in messages:
                 if "file" in msg:
                     sent_message = await channel.send(content=msg["content"], file=msg["file"])
-                    self.logger.info(f"Sent message with file to channel {getattr(channel, 'name', 'DM')}: {msg['content']}")
+                    self.logger.info(f"Sent message with file to channel {channel.name}: {msg['content']}")
                 else:
                     # Check message length and split
                     content_parts = split_message(msg["content"])
                     for part in content_parts:
                         sent_message = await channel.send(content=part)
-                        self.logger.info(f"Sent message part to channel {getattr(channel, 'name', 'DM')}: {part[:100]}...")
+                        self.logger.info(f"Sent message part to channel {channel.name}: {part}")
 
-            # If there are notes, process them line by line
+            # If there are notes, send them separately at the end
             if notes and not self._is_notes_empty(notes):
                 # Remove possible "Notes: " prefix
                 cleaned_notes = notes
                 if cleaned_notes.startswith("Notes: "):
                     cleaned_notes = cleaned_notes[7:]  # Remove "Notes: " prefix
-                    
-                # Process notes line by line
-                valid_notes = []
-                for line in cleaned_notes.split('\n'):
-                    line = line.strip()
-                    if line and not self._is_notes_empty(line, check_line=True):
-                        # 如果行以 * 开头，保留原格式，否则添加 *
-                        if not line.startswith('*'):
-                            line = f"* {line}"
-                        valid_notes.append(line)
-                        
-                if valid_notes:  # Only send if there are valid notes
-                    # Send notes title first
-                    await channel.send(content=titles["notes"])
-                    # Then send filtered notes content without additional asterisks
-                    sent_message = await channel.send(chr(10).join(valid_notes))
-                    self.logger.info(f"Sent filtered notes to channel {getattr(channel, 'name', 'DM')}")
+                # Send notes title first
+                await channel.send(content=titles["notes"])
+                # Then send notes content (without Notes: prefix)
+                sent_message = await channel.send(f"*{cleaned_notes}*")
+                self.logger.info(f"Sent notes to channel {channel.name}: {cleaned_notes}")
 
         except discord.errors.HTTPException as e:
             if e.code == 50035:  # Message length error
@@ -917,7 +856,7 @@ class TranslatorBot(commands.Bot):
                 self.logger.error(f"Discord HTTPException: {str(e)}")
                 raise
 
-    async def handle_attachments(self, attachments, target_channel, is_dm=False):
+    async def handle_attachments(self, attachments, target_channel):
         """Process attachments in messages"""
         self.logger.debug(f"Attachment count: {len(attachments)}")
         for index, attachment in enumerate(attachments, start=1):
@@ -928,24 +867,18 @@ class TranslatorBot(commands.Bot):
                     translated_image = await self.translator.translate_image(attachment.url)
                     self.logger.debug(f"Attachment image translation result: {translated_image}")
                     if translated_image:
-                        # 统一使用send_translation_result处理翻译结果
                         await self.send_translation_result(
                             target_channel,
                             translated_image.get("original"),
                             translated_image.get("translation"),
                             notes=translated_image.get("notes"),
-                            image_url=attachment.url,
-                            is_dm=is_dm
+                            image_url=attachment.url
                         )
                         self.logger.info("Attachment image translation completed")
                 except Exception as e:
                     self.logger.error(f"Error translating attachment image: {str(e)}", exc_info=True)
-                    if is_dm:
-                        await target_channel.send("Error translating image attachment.")
             else:
                 self.logger.debug(f"Current attachment is not an image or missing content_type: {attachment.url}")
-                if is_dm:
-                    await target_channel.send(f"Attachment type not supported: {attachment.content_type or 'unknown type'}")
 
     async def fetch_referenced_message(self, message):
         """Fetch referenced message"""
@@ -1478,7 +1411,7 @@ class TranslatorBot(commands.Bot):
         # All components are special content
         return True
 
-    def _is_notes_empty(self, notes: str, check_line: bool = False) -> bool:
+    def _is_notes_empty(self, notes: str) -> bool:
         """Check if notes are empty or meaningless"""
         # Check if it's None or empty string
         if not notes:
@@ -1687,12 +1620,7 @@ class TranslatorBot(commands.Bot):
                 if self.translator.session and not self.translator.session.closed:
                     await self.translator.session.close()
                     self.logger.info("Translator's aiohttp ClientSession closed successfully.")
-
-            # Cancel and wait for DM whitelist update task to complete
-            if hasattr(self, 'update_dm_whitelist_task') and self.update_dm_whitelist_task.is_running():
-                self.update_dm_whitelist_task.cancel()
-                self.logger.info("DM Whitelist update task cancelled.")
-
+            
             # Close bot's session
             if hasattr(self, 'session') and self.session and not self.session.closed:
                 await self.session.close()
@@ -1705,56 +1633,8 @@ class TranslatorBot(commands.Bot):
         except Exception as e:
             self.logger.error(f"Cleanup error: {str(e)}", exc_info=True)
 
-    async def on_ready(self):
-        """Called when the bot is ready and connected to Discord"""
-        try:
-            # ensure bot is fully ready
-            await self.wait_until_ready()
-            
-            # Clear global commands to prevent DM registration
-            self.logger.info("Attempting to clear global commands...")
-            try:
-                # 1. Clear any commands registered globally in the bot's main tree
-                self.tree.clear_commands(guild=None)
-                # 2. Sync the now empty global command list to Discord
-                await self.tree.sync(guild=None)
-                self.logger.info("Successfully cleared and synced global commands.")
-            except Exception as e:
-                self.logger.error(f"Failed to clear global commands: {e}", exc_info=True)
-
-            # Sync commands to all guilds
-            self.logger.info(f"Syncing commands to {len(self.guilds)} servers")
-            for guild in self.guilds:
-                try:
-                    # first clear all commands of the server
-                    self.tree.clear_commands(guild=guild)
-                    
-                    # then add all commands to the server
-                    for cmd in self.command_list:
-                        # add command to specific server
-                        self.tree.add_command(cmd, guild=guild)
-                    
-                    # finally sync to the server
-                    await self.tree.sync(guild=guild)
-                    self.logger.info(f"Synced {len(self.command_list)} commands to server: {guild.name} (ID: {guild.id})")
-                except Exception as e:
-                    self.logger.error(f"Failed to sync commands to server {guild.id}: {e}", exc_info=True)
-            
-            self.logger.info("All commands registered and synced to guilds.")
-
-            if hasattr(self, 'update_dm_whitelist_task') and not self.update_dm_whitelist_task.is_running():
-                self.logger.info("Starting DM Whitelist update task from on_ready...")
-                self.update_dm_whitelist_task.start()
-                self.logger.info("DM Whitelist update task started.")
-
-
-        except Exception as e:
-            self.logger.error(f"Error in on_ready: {str(e)}", exc_info=True)
-            async with aiohttp.ClientSession() as temp_session:
-                webhook = discord.Webhook.from_url(ERROR_WEBHOOK_URL, session=temp_session)
-                await webhook.send(f"On Ready Error: {str(e)}")
-
 def main():
+    ERROR_WEBHOOK_URL = os.getenv('ERROR_WEBHOOK_URL')
 
     bot = None
     for attempt in range(3):

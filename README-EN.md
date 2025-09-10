@@ -24,13 +24,13 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
 ### **2. Content Handling**
 
-- **Multi-Format Content Parsing:** Supports translation of `plain text`, `attached images`, `embeds`, `forwarded messages`. (When handling forwarded messages, the bot needs permission to read the source channel).
+- **Multi-Format Content Parsing:** Supports translation of `plain text`, `attached images`, `embeds`, `forwarded messages`, `FxTwitter`. (When handling forwarded messages, the bot needs permission to read the source channel).
 - **Content Pre-Filtering:** Filters out lines that only contain emojis, custom Discord emojis, punctuation, numbers, or empty content to reduce redundant translations.
 - **Automatic URL Wrapping:** Automatically wraps URLs with ``` to prevent repeated recognition and expansion by bots who fix URL.
 
 ### **3. Optimized Load Balancing**
 
-- **Dual-Model Auto-Switching:** Automatically switches to the backup model `gemini-1.5-flash` if the primary model `gemini-2.0-flash-exp` fails.
+- **Dual-Model Auto-Switching:** Automatically switches to the backup model `gemini-2.0-flash` if the primary model `gemini-2.5-flash` fails.
 - **Smart Rate Limiting:** Randomly rotates multiple API keys, with built-in rate limiting and retry strategies to avoid 429 errors.
 - **Adaptive Concurrency Control:** Built-in message deduplication and caching mechanisms, with an asynchronous message queue ensuring Discord messages are processed in the order they were sent.
 - **Automatic Log Rotation & Cleanup:** Logs older than 7 days are automatically cleaned up, and log files are rotated daily to maintain system efficiency.
@@ -67,19 +67,24 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
     DISCORD_TOKEN=MAAAAAAA.GBBBBBBB.RCCCCCCCCCCCCCCCCCCCCCCCC-ng
           
     # Gemini API key(s); filling at least one is sufficient
-    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....      
+    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....
 
     # Webhook URL for receiving error notifications
-    ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR      
+    ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR
 
     # Channel ID for receiving error notifications
-    ERROR_CHANNEL_ID=0000000000000000000      
-
-    # User ID for receiving error notifications
-    ERROR_NOTIFY_USER_ID=0000000000000000000      
+    ERROR_CHANNEL_ID=0000000000000000000
 
     # Default language, can be anything, default is zh-CN
-    DEFAULT_TARGET_LANG=zh-CN      
+    DEFAULT_TARGET_LANG=zh-CN
+
+    # Logging Configuration
+    # LOG_LEVEL_ROOT: Global logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    # LOG_LEVEL_FILE: File logging level
+    # LOG_LEVEL_CONSOLE: Console logging level    
+    LOG_LEVEL_ROOT=INFO
+    LOG_LEVEL_FILE=INFO
+    LOG_LEVEL_CONSOLE=INFO
     ```
     
 - **Run the Bot**
@@ -88,6 +93,10 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
     python3 discord_bot.py
     ```
     
+
+- **Upgrading an existing bot**
+
+    After stopping the bot, reinstall the dependencies using `pip install -r requirements.txt` and then restart the bot.
 
 ## 📔**How To Use**
 
