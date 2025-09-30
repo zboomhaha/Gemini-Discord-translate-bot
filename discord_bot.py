@@ -41,6 +41,8 @@ class TranslatorBot(commands.Bot):
         # Initialize Discord bot
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.dm_messages = True  # Enable DM messages
+        intents.members = True  # Enable members intent for fetching guild members
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -87,6 +89,11 @@ class TranslatorBot(commands.Bot):
         # Add blocked users file path
         self.blocked_users_file = 'blocked_users.json'
         self.blocked_users = self.load_blocked_users()
+
+        # Add DM whitelist file path and initialization
+        self.dm_whitelist_file = 'dm_whitelist.json'
+        self.dm_whitelist = self.load_dm_whitelist()
+        self.whitelist_update_task = None
         
         # Add regex patterns as class properties
         self.discord_emoji_pattern = r'<a?:\w+:\d+>'  # Discord custom emojis
@@ -158,82 +165,38 @@ class TranslatorBot(commands.Bot):
 
             # Start cleanup tasks
             self.cleanup_task = self.loop.create_task(self._cleanup_messages())
+
+            # Start DM whitelist update task
+            self.whitelist_update_task = self.loop.create_task(self._update_dm_whitelist())
+
             self.logger.info("Initialized setup hook.")           
             
-            # Register all commands
-            # 1. Translation channel management commands
-            for cmd in [
-                app_commands.Command(
-                    name="set_translation_channel",
-                    description="Set current channel as translation channel",
-                    callback=self.set_translation_channel
-                ),
-                app_commands.Command(
-                    name="remove_translation_channel",
-                    description="Remove translation feature from current channel",
-                    callback=self.remove_translation_channel
-                ),
-                app_commands.Command(
-                    name="list_translation_channels",
-                    description="List all translation channel mappings",
-                    callback=self.list_translation_channels
-                ),
-                app_commands.Command(
-                    name="block_user",
-                    description="Block message translation for specified user/bot",
-                    callback=self.block_user
-                ),
-                app_commands.Command(
-                    name="unblock_user",
-                    description="Unblock message translation for specified user/bot",
-                    callback=self.unblock_user
-                ),
-                app_commands.Command(
-                    name="block_webhook",
-                    description="Block webhook",
-                    callback=self.block_webhook
-                ),
-                app_commands.Command(
-                    name="unblock_webhook",
-                    description="Unblock webhook",
-                    callback=self.unblock_webhook
-                ),
-                app_commands.Command(
-                    name="list_blocks",
-                    description="List all blocked users/bots/webhooks",
-                    callback=self.list_blocks
-                ),
-                app_commands.Command(
-                    name="add_glossary_term",
-                    description="Add glossary term",
-                    callback=self.add_glossary_term
-                ),
-                app_commands.Command(
-                    name="remove_glossary_term",
-                    description="Remove glossary term",
-                    callback=self.remove_glossary_term
-                ),
-                app_commands.Command(
-                    name="list_glossary",
-                    description="List all glossary terms",
-                    callback=self.list_glossary
-                ),
-                app_commands.Command(
-                    name="add_skip_keyword",
-                    description="Add a skip keyword",
-                    callback=self.add_skip_keyword
-                ),
-                app_commands.Command(
-                    name="remove_skip_keyword",
-                    description="Remove a skip keyword",
-                    callback=self.remove_skip_keyword
-                ),
-                app_commands.Command(
-                    name="list_skip_keywords",
-                    description="List all skip keywords",
-                    callback=self.list_skip_keywords
-                ),
-            ]:
+            # Register all commands (guild-only to prevent showing in DMs)
+            commands_info = [
+                ("set_translation_channel", "Set current channel as translation channel", self.set_translation_channel),
+                ("remove_translation_channel", "Remove translation feature from current channel", self.remove_translation_channel),
+                ("list_translation_channels", "List all translation channel mappings", self.list_translation_channels),
+                ("block_user", "Block message translation for specified user/bot", self.block_user),
+                ("unblock_user", "Unblock message translation for specified user/bot", self.unblock_user),
+                ("block_webhook", "Block webhook", self.block_webhook),
+                ("unblock_webhook", "Unblock webhook", self.unblock_webhook),
+                ("list_blocks", "List all blocked users/bots/webhooks", self.list_blocks),
+                ("add_glossary_term", "Add glossary term", self.add_glossary_term),
+                ("remove_glossary_term", "Remove glossary term", self.remove_glossary_term),
+                ("list_glossary", "List all glossary terms", self.list_glossary),
+                ("add_skip_keyword", "Add a skip keyword", self.add_skip_keyword),
+                ("remove_skip_keyword", "Remove a skip keyword", self.remove_skip_keyword),
+                ("list_skip_keywords", "List all skip keywords", self.list_skip_keywords),
+            ]
+
+            for name, description, callback in commands_info:
+                cmd = app_commands.Command(
+                    name=name,
+                    description=description,
+                    callback=callback
+                )
+                # Mark command as guild-only to prevent showing in DMs
+                cmd.guild_only = True
                 self.tree.add_command(cmd)
 
             await self.tree.sync(guild=None) 
@@ -265,6 +228,18 @@ class TranslatorBot(commands.Bot):
     async def on_connect(self):
         self.logger.info("Bot connected to Discord")
         self.logger.info(f"Latency: {round(self.latency * 1000)}ms")
+
+        # Trigger immediate whitelist update after connection
+        if hasattr(self, '_first_connect') and self._first_connect:
+            return
+        self._first_connect = True
+
+        # Wait a bit for guilds to be populated after connection
+        await asyncio.sleep(2)
+        self.logger.debug(f"After connection, guilds count: {len(self.guilds)}")
+
+        # Manually trigger whitelist update
+        asyncio.create_task(self._do_whitelist_update())
 
     async def on_disconnect(self):
         self.logger.info("Bot disconnected from Discord")    
@@ -303,6 +278,33 @@ class TranslatorBot(commands.Bot):
         except Exception as e:
             self.logger.error(f"Failed to load blocked users: {str(e)}")
             return []  # Return empty list if error
+
+    def load_dm_whitelist(self):
+        """Load DM whitelist from file"""
+        try:
+            if os.path.exists(self.dm_whitelist_file):
+                with open(self.dm_whitelist_file, 'r') as f:
+                    data = json.load(f)
+                    # Convert to set for faster lookup, ensure all are strings
+                    return set(str(uid) for uid in data.get('auto_users', []))
+            # If file doesn't exist, create default empty structure
+            default_data = {'auto_users': []}
+            with open(self.dm_whitelist_file, 'w') as f:
+                json.dump(default_data, f, indent=2)
+            return set()
+        except Exception as e:
+            self.logger.error(f"Failed to load DM whitelist: {str(e)}")
+            return set()
+
+    def save_dm_whitelist(self):
+        """Save DM whitelist to file"""
+        try:
+            data = {'auto_users': sorted(list(self.dm_whitelist))}
+            with open(self.dm_whitelist_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.logger.info(f"Saved DM whitelist with {len(self.dm_whitelist)} users")
+        except Exception as e:
+            self.logger.error(f"Failed to save DM whitelist: {str(e)}")
 
     def require_permissions(permission):
         """Decorator for permission checking"""
@@ -372,10 +374,31 @@ class TranslatorBot(commands.Bot):
             # Check 1: Whether it is a message from the bot itself
             if message.author == self.user:
                 return
-            
-            # Check 2: Whether it is from source channel
-            if message.channel.id not in self.translation_channels:
-                return
+
+            # Check if it's a DM
+            is_dm = isinstance(message.channel, discord.DMChannel)
+
+            if is_dm:
+                # For DM: Check if user is in the whitelist
+                if message.author.bot:
+                    self.logger.debug(f"Ignoring DM from bot: {message.author}")
+                    return
+
+                # Check if user ID is in DM whitelist
+                user_id_str = str(message.author.id)
+                if user_id_str not in self.dm_whitelist:
+                    self.logger.info(f"DM from user not in whitelist: {message.author} (ID: {user_id_str})")
+                    try:
+                        await message.channel.send("检测到你不在服务器中，暂时无法使用~")
+                    except Exception as e:
+                        self.logger.error(f"Failed to send rejection message: {str(e)}")
+                    return
+
+                self.logger.info(f"Processing DM from {message.author} (ID: {user_id_str})")
+            else:
+                # Check 2: For server messages, check if channel is in translation channels
+                if message.channel.id not in self.translation_channels:
+                    return
                 
             # Check 3: Whether it has been processed
             message_key = f"{message.channel.id}:{message.id}"
@@ -404,7 +427,10 @@ class TranslatorBot(commands.Bot):
                     
             # After passing all checks, add to queue
             await self.message_queue.put(message)
-            self.logger.info(f"Message {message.id} added to queue")
+            if is_dm:
+                self.logger.info(f"DM message {message.id} from {message.author} added to queue")
+            else:
+                self.logger.info(f"Message {message.id} added to queue from channel {message.channel.name}")
                 
         except Exception as e:
             self.logger.error(f"Error in message pre-check: {str(e)}", exc_info=True)
@@ -437,17 +463,26 @@ class TranslatorBot(commands.Bot):
         self.logger.info(f"Start processing message: {message.id}")
         message_processed = False
         is_successful_run = False
-        
+
         try:
-            target_channel_id = self.translation_channels.get(message.channel.id)
-            if not target_channel_id:
-                self.logger.error(f"No target channel ID configured for: {message.channel.id}")
-                return False
-            
-            target_channel = self.get_channel(target_channel_id)
-            if not target_channel:
-                self.logger.error(f"Target channel not found: {target_channel_id}")
-                return False
+            # Check if it's a DM
+            is_dm = isinstance(message.channel, discord.DMChannel)
+
+            if is_dm:
+                # For DM, target channel is the DM channel itself
+                target_channel = message.channel
+                self.logger.info(f"Processing DM - will reply in same DM channel")
+            else:
+                # For server messages, use configured target channel
+                target_channel_id = self.translation_channels.get(message.channel.id)
+                if not target_channel_id:
+                    self.logger.error(f"No target channel ID configured for: {message.channel.id}")
+                    return False
+
+                target_channel = self.get_channel(target_channel_id)
+                if not target_channel:
+                    self.logger.error(f"Target channel not found: {target_channel_id}")
+                    return False
 
             # Record message processing
             message_key = f"{message.channel.id}:{message.id}"
@@ -469,7 +504,10 @@ class TranslatorBot(commands.Bot):
             return message_processed
         
         except Exception as e:
-            self.logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            if is_dm:
+                self.logger.error(f"Error processing DM from {message.author}: {str(e)}", exc_info=True)
+            else:
+                self.logger.error(f"Error processing message: {str(e)}", exc_info=True)
             await self.send_error_message(str(e))
             return False
         
@@ -742,11 +780,17 @@ class TranslatorBot(commands.Bot):
             self.logger.error(f"Error processing text: {str(e)}")
             return None
 
+    def _get_channel_name(self, channel):
+        """Get channel display name, handling both DM and regular channels"""
+        if isinstance(channel, discord.DMChannel):
+            return f"DM with {channel.recipient.name if channel.recipient else 'Unknown'}"
+        return channel.name if hasattr(channel, 'name') else str(channel.id)
+
     async def send_translation_result(self, channel, original, translated, notes=None, image_url=None):
         """Format and send translation result to Discord"""
         try:
-
-            self.logger.info("Processing translation for sending")
+            channel_name = self._get_channel_name(channel)
+            self.logger.info(f"Processing translation for sending to {channel_name}")
             messages = []
 
             # Set split titles based on target language
@@ -828,13 +872,13 @@ class TranslatorBot(commands.Bot):
             for msg in messages:
                 if "file" in msg:
                     sent_message = await channel.send(content=msg["content"], file=msg["file"])
-                    self.logger.info(f"Sent message with file to channel {channel.name}: {msg['content']}")
+                    self.logger.info(f"Sent message with file to {channel_name}: {msg['content']}")
                 else:
                     # Check message length and split
                     content_parts = split_message(msg["content"])
                     for part in content_parts:
                         sent_message = await channel.send(content=part)
-                        self.logger.info(f"Sent message part to channel {channel.name}: {part}")
+                        self.logger.info(f"Sent message part to {channel_name}: {part}")
 
             # If there are notes, send them separately at the end
             if notes and not self._is_notes_empty(notes):
@@ -1452,6 +1496,62 @@ class TranslatorBot(commands.Bot):
 
     """ CLEANUP """
 
+    async def _do_whitelist_update(self):
+        """Execute a single DM whitelist update"""
+        try:
+            self.logger.debug(f"Starting DM whitelist update. Guilds count: {len(self.guilds)}")
+
+            if len(self.guilds) == 0:
+                self.logger.warning("No guilds found. Bot may not be in any servers.")
+                self.dm_whitelist = set()
+                self.save_dm_whitelist()
+                return
+
+            # Collect all unique user IDs from all guilds
+            user_ids = set()
+            for guild in self.guilds:
+                self.logger.debug(f"Processing guild: {guild.name} (ID: {guild.id}), member_count: {guild.member_count}")
+                member_count = 0
+                human_count = 0
+                try:
+                    # Fetch all members to ensure we have the complete list
+                    async for member in guild.fetch_members(limit=None):
+                        member_count += 1
+                        if not member.bot:  # Only human users
+                            user_ids.add(str(member.id))
+                            human_count += 1
+                            self.logger.debug(f"Added human user: {member.name} (ID: {member.id})")
+                    self.logger.debug(f"Guild {guild.name}: fetched {member_count} members, {human_count} humans")
+                except Exception as e:
+                    self.logger.error(f"Error fetching members from guild {guild.name}: {str(e)}", exc_info=True)
+
+            self.dm_whitelist = user_ids
+            self.save_dm_whitelist()
+            self.logger.info(f"Updated DM whitelist: {len(user_ids)} users from {len(self.guilds)} guilds")
+
+        except Exception as e:
+            self.logger.error(f"Error in whitelist update: {str(e)}", exc_info=True)
+
+    async def _update_dm_whitelist(self):
+        """Periodically update DM whitelist with all guild members (every 24 hours)"""
+        try:
+            await self.wait_until_ready()
+
+            # Wait for the first manual update triggered by on_connect to complete
+            # The on_connect waits 2 seconds then triggers update, so we wait longer
+            await asyncio.sleep(15)
+
+            # Then run periodic updates every 24 hours
+            while True:
+                await self._do_whitelist_update()
+                # Wait 24 hours before next update
+                await asyncio.sleep(86400)
+
+        except asyncio.CancelledError:
+            self.logger.info("DM whitelist update task cancelled")
+        except Exception as e:
+            self.logger.error(f"Error in whitelist update loop: {str(e)}", exc_info=True)
+
     async def _cleanup_messages(self):
         """Periodically clean expired messages"""
         while True:
@@ -1606,7 +1706,15 @@ class TranslatorBot(commands.Bot):
                     await self.cleanup_task
                 except asyncio.CancelledError:
                     self.logger.info("Cleanup task cancelled successfully.")
-            
+
+            # Cancel and wait for whitelist update task to complete
+            if hasattr(self, 'whitelist_update_task') and self.whitelist_update_task:
+                self.whitelist_update_task.cancel()
+                try:
+                    await self.whitelist_update_task
+                except asyncio.CancelledError:
+                    self.logger.info("Whitelist update task cancelled successfully.")
+
             # Cancel and wait for message processing task to complete
             if hasattr(self, 'message_processor_task') and self.message_processor_task:
                 self.message_processor_task.cancel()
