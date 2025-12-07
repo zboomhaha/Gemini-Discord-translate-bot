@@ -1,16 +1,21 @@
-# 编辑 .gitignore 文件
-echo "# 环境变量文件
+# Environment variables
 .env
 
 # Python
 __pycache__/
 *.py[cod]
 *.so
+venv/
+.venv/
+env/
 
-# 日志
+# Logs
 logs/
 *.log
 
-# 系统文件
+# System
 .DS_Store
-Thumbs.db" > .gitignore
+Thumbs.db
+
+# Configuration
+providers.json

@@ -13,6 +13,15 @@
 
 Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，能够实时翻译指定频道里的文本、图像、embed消息。<br>适应Discord特性，分段返回原文、翻译和注释，方便复制粘贴。
 
+## 📅**更新日志**
+
+### **2025-12-08: Multi-Provider Support**
+- **多服务商支持：** 新增 `providers.json` 配置文件，支持同时配置官方 Gemini API 和自定义中转 API。
+- **配置迁移：** 废弃 `.env` 中的 `GEMINI_API_KEYS`，所有 API Key 统一管理在 `providers.json` 中。
+- **自定义 Provider：** 支持添加任意兼容 Gemini 接口的自定义服务商（使用 Raw HTTP 请求）。
+- **智能回退：** `providers.json` 中可配置多个服务商及优先级。当主服务商（如官方 API）不可用或速率受限时，自动切换至备用服务商，并发送 Webhook 通知。
+- **精细化控制：** 支持为不同模型、不同服务商单独配置 RPM (Requests Per Minute) 速率限制。
+
 ## 💡**功能亮点**
 
 ### **1. 丰富的Slash Commands**
@@ -29,7 +38,7 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 
 ### **3. 负载均衡优化**
 
-- **双模型自动切换：** 主模型`gemini-2.5-flash`失败时自动切换到备用模型`gemini-2.0-flash`。
+- **双模型自动切换：** 主模型`gemini-2.5-flash`失败时自动切换到备用模型`gemini-2.5-flash-lite`。
 - **智能速率限制：** 随机轮换多个API 密钥、内置请求速率限制与重试策略，避免429。
 - **自适应并发控制：** 内置消息去重与缓存机制，异步消息队列可确保频道内的Discord消息按发送顺序处理。
 - **自动轮转和清理日志：** 日志文件每日自动轮转，自动清理超过7天的日志记录。
@@ -70,8 +79,6 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
     #你的Discord bot token
     DISCORD_TOKEN=MAAAAAAA.GBBBBBBB.RCCCCCCCCCCCCCCCCCCCCCCCC-ng
           
-    #Gemini API key,可以只填一个
-    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....
 
     #接收错误通知的Webhook URL
     ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR
@@ -91,6 +98,44 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
     LOG_LEVEL_FILE=INFO
     LOG_LEVEL_CONSOLE=INFO
     ```
+
+- **配置 `providers.json`（新版核心配置）**
+    
+    机器人首次运行后会自动在根目录生成 `providers.json` 模板。你需要在此文件中配置 API Key 和服务商信息。
+
+    **配置示例：**
+
+    ```json
+    {
+        "settings": {
+            "provider_order": ["official", "my_custom_provider"] // 服务商优先级顺序
+        },
+        "providers": {
+            "official": {
+                "type": "official", // 官方提供商类型
+                "api_keys": [ "OFFICIAL_KEY_1", "OFFICIAL_KEY_2" ],
+                "models": [ 
+                    { "name": "gemini-2.5-flash", "rpm": 5 },
+                    { "name": "gemini-2.5-flash-lite", "rpm": 10 }
+                ]
+            },
+            "my_custom_provider": {
+                "type": "custom", // 自定义提供商类型
+                "base_url": "https://api.third-party.com", // 自定义 Base URL，结尾不可有斜杠
+                "api_keys": [ "OFFICIAL_KEY_1", "OFFICIAL_KEY_2" ],
+                "models": [
+                    { "name": "gemini-2.5-flash", "rpm": 60 }, // 自定义 RPM
+                    { "name": "gemini-2.5-flash-lite", "rpm": 60 } // 自定义 RPM
+                ]
+            }
+        }
+    }
+    ```
+
+    - **`type`**: `official` (官方SDK) 或 `custom` (第三方接口，必须支持Gemini原生格式)。
+    - **`base_url`**: 自定义服务商的 API 地址（仅 `custom` 类型需要）。
+    - **`rpm`**: 每分钟请求数限制，机器人会根据此值自动进行速率控制。
+
     
 - **运行bot**
     

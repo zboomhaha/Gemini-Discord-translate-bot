@@ -1,0 +1,44 @@
+{
+    "settings": {
+        "provider_order": [
+            "official"
+        ]
+    },
+    "providers": {
+        "official": {
+            "type": "official",
+            "api_keys": [
+                "key1",
+                "key2"
+            ],
+            "models": [
+                {
+                    "name": "gemini-2.5-flash",
+                    "rpm": 5
+                },
+                {
+                    "name": "gemini-2.5-flash-lite",
+                    "rpm": 10
+                }
+            ]
+        },
+        "custom-provider": {
+            "type": "custom",
+            "base_url": "https://your-custom-endpoint.com/v1beta",
+            "api_keys": [
+                "key1",
+                "key2"
+            ],
+            "models": [
+                {
+                    "name": "gemini-2.5-flash",
+                    "rpm": 5
+                },
+                {
+                    "name": "gemini-2.5-flash-lite",
+                    "rpm": 10
+                }
+            ]
+        }
+    }
+}

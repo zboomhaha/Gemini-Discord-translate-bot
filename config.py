@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,19 +58,16 @@ class Config:
             self.ERROR_CHANNEL_ID = int(os.getenv('ERROR_CHANNEL_ID', '0'))
             
             # Gemini configuration
-            logger.info("Loading Gemini configuration...")
-            gemini_keys_env = os.getenv('GEMINI_API_KEYS', '')
-            self.GEMINI_API_KEYS = [
-                key.strip() 
-                for key in gemini_keys_env.split(',') 
-                if key.strip()
-            ]
+            logger.info("Loading providers configuration...")
+            self.PROVIDERS_CONFIG = self.load_providers_config()
             
-            if not self.GEMINI_API_KEYS:
-                raise ValueError("No Gemini API keys found in .env")
-            
-            logger.info(f"Loaded {len(self.GEMINI_API_KEYS)} Gemini API keys")
-            
+            # Validate official provider keys
+            official_config = self.PROVIDERS_CONFIG.get('providers', {}).get('official', {})
+            if not official_config.get('api_keys'):
+                logger.warning("No API keys found for 'official' provider in providers.json. Please configure them.")
+            else:
+                logger.info(f"Loaded {len(official_config['api_keys'])} keys for official provider")
+
             # Translation configuration
             logger.info("Loading translation configuration...")
             self.TRANSLATION_COOLDOWN = 10
@@ -213,8 +211,53 @@ Task Requirements:
 
             logger.info("Configuration loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load configuration: {str(e)}", exc_info=True)
-            raise Exception(f"Failed to load configuration: {str(e)}")
+            logger.error(f"Error loading configuration: {str(e)}")
+            raise
+
+    def load_providers_config(self):
+        """Load providers configuration from JSON file"""
+        config_path = 'providers.json'
+        
+        try:
+            if not os.path.exists(config_path):
+                # Create default template if not exists
+                default_config = {
+                    "settings": {
+                        "provider_order": ["official"]
+                    },
+                    "providers": {
+                        "official": {
+                            "type": "official",
+                            "api_keys": [],
+                            "models": [
+                                {
+                                    "name": "gemini-2.5-flash",
+                                    "rpm": 5
+                                },
+                                {
+                                    "name": "gemini-2.5-flash-lite",
+                                    "rpm": 10
+                                }
+                            ]
+                        }
+                    }
+                }
+                
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(default_config, f, indent=4)
+                
+                logging.getLogger(__name__).warning(f"Created default {config_path}. Please add your API keys!")
+                return default_config
+
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            return config
+                
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Failed to load {config_path}: {str(e)}")
+            # Return minimal safe config
+            return {"settings": {"provider_order": []}, "providers": {}}
 
 # Create configuration instance
 config = Config()
@@ -228,7 +271,7 @@ DEFAULT_TARGET_LANG = config.DEFAULT_TARGET_LANG
 SAFETY_SETTINGS = config.SAFETY_SETTINGS
 TRANSLATION_PROMPT = config.TRANSLATION_PROMPT
 IMAGE_TRANSLATION_PROMPT = config.IMAGE_TRANSLATION_PROMPT
-GEMINI_API_KEYS = config.GEMINI_API_KEYS
+PROVIDERS_CONFIG = config.PROVIDERS_CONFIG
 EMPTY_INDICATORS = config.EMPTY_INDICATORS
 LOG_LEVEL_ROOT = config.LOG_LEVEL_ROOT
 LOG_LEVEL_FILE = config.LOG_LEVEL_FILE

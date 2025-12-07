@@ -10,37 +10,300 @@ from google.genai import types
 from asyncio import Semaphore
 from typing import Dict, Optional, List
 from PIL import Image
-from config import GEMINI_API_KEYS, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAULT_TARGET_LANG, IMAGE_TRANSLATION_PROMPT, EMPTY_INDICATORS
+from datetime import datetime
+import discord
+from config import PROVIDERS_CONFIG, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAULT_TARGET_LANG, IMAGE_TRANSLATION_PROMPT, EMPTY_INDICATORS, ERROR_WEBHOOK_URL
+
+class BaseProvider:
+    """Abstract base class for translation providers"""
+    def __init__(self, name: str, config: Dict):
+        self.name = name
+        self.config = config
+        self.logger = logging.getLogger(f"{self.__class__.__name__}.{name}")
+        self.api_keys = config.get('api_keys', [])
+        # models config: [{"name": "model_name", "rpm": 5}, ...]
+        self.models_config = config.get('models', [])
+        self.current_key_idx = 0
+        
+        # Initialize Rate Limiters for each model
+        # Map: model_name -> {"semaphore": Semaphore, "last_calls": [timestamps], "rpm": int}
+        self.rate_limiters = {}
+        for model_cfg in self.models_config:
+            model_name = model_cfg['name']
+            rpm = model_cfg.get('rpm', 5)
+            self.rate_limiters[model_name] = {
+                "semaphore": Semaphore(1), # Concurrency lock mainly for rate limit check
+                "last_call_time": 0,
+                "interval": 60.0 / rpm if rpm > 0 else 0,
+                "rpm": rpm
+            }
+            
+    async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
+        raise NotImplementedError
+
+    async def _check_rate_limit(self, model_name: str):
+        """Enforce RPM limit"""
+        limiter = self.rate_limiters.get(model_name)
+        if not limiter:
+            return
+            
+        async with limiter["semaphore"]:
+            current_time = asyncio.get_running_loop().time()
+            time_since_last = current_time - limiter["last_call_time"]
+            
+            if time_since_last < limiter["interval"]:
+                wait_time = limiter["interval"] - time_since_last
+                self.logger.debug(f"Rate limit: Waiting {wait_time:.2f}s for model {model_name}")
+                await asyncio.sleep(wait_time)
+            
+            limiter["last_call_time"] = asyncio.get_running_loop().time()
+
+    def _get_next_key(self) -> Optional[str]:
+        """Round-robin key selection"""
+        if not self.api_keys:
+            return None
+        key = self.api_keys[self.current_key_idx]
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+        return key
+
+class OfficialProvider(BaseProvider):
+    """Provider for Google Official SDK (google-genai)"""
+    def __init__(self, name: str, config: Dict, safety_settings: List):
+        super().__init__(name, config)
+        self.safety_settings = safety_settings
+        
+    async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
+        # Retry with different keys if needed, but for now we follow simple logic:
+        # One request per call, but if we want to handle key rotation on error, we do it here.
+        # We try up to len(keys) times or 3 times max.
+        
+        max_retries = len(self.api_keys) if self.api_keys else 1
+        retries = 0
+        
+        while retries < max_retries:
+            key = self._get_next_key()
+            if not key:
+                raise ValueError("No API keys configured for official provider")
+                
+            try:
+                await self._check_rate_limit(model_name)
+                
+                client = genai.Client(api_key=key)
+                
+                contents = [prompt]
+                if image_data:
+                    # Official SDK expects 'image/jpeg' part
+                    image_part = types.Part.from_bytes(data=image_data, mime_type='image/jpeg')
+                    contents.append(image_part)
+                
+                # Configuration logic similar to original
+                gen_config_params = {
+                    "candidate_count": 1,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                }
+                
+                if image_data:
+                    gen_config_params.update({"temperature": 1.0})
+                else:
+                    gen_config_params.update({"temperature": 1.2})
+
+                # Special config for gemini-2.5-flash
+                if model_name == 'gemini-2.5-flash':
+                     config = types.GenerateContentConfig(
+                        **gen_config_params,
+                        safety_settings=self.safety_settings,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0)
+                    )
+                else:
+                    config = types.GenerateContentConfig(
+                        **gen_config_params,
+                        safety_settings=self.safety_settings
+                    )
+
+                # Execute in executor to avoid blocking
+                partial_func = functools.partial(
+                    client.models.generate_content,
+                    model=f"models/{model_name}",
+                    contents=contents,
+                    config=config
+                )
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(None, partial_func)
+                
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    self.logger.warning(f"Blocked: {response.prompt_feedback}")
+                    return None
+                    
+                return response.text if hasattr(response, 'text') else str(response)
+
+            except Exception as e:
+                self.logger.warning(f"Key {key[:5]}... failed: {str(e)}")
+                retries += 1
+                if "429" in str(e):
+                    continue # Rate limit, try next key
+                if "API key" in str(e) and ("invalid" in str(e) or "not found" in str(e)):
+                     # Could remove key effectively here
+                     continue
+                # For other errors, maybe we still want to try next key?
+                # Let's be aggressive and try next key.
+        
+        raise Exception(f"All keys failed for provider {self.name}")
+
+class CustomProvider(BaseProvider):
+    """Provider for Custom Base URL (Raw HTTP)"""
+    def __init__(self, name: str, config: Dict):
+        super().__init__(name, config)
+        self.base_url = config.get('base_url', '').rstrip('/')
+        if not self.base_url:
+            raise ValueError(f"No base_url configured for custom provider {name}")
+            
+    async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
+        max_retries = len(self.api_keys) if self.api_keys else 1
+        retries = 0
+        
+        import base64
+        
+        while retries < max_retries:
+            key = self._get_next_key()
+            if not key:
+                raise ValueError(f"No API keys configured for provider {self.name}")
+                
+            try:
+                await self._check_rate_limit(model_name)
+                
+                url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
+                
+                # Construct payload
+                parts = [{"text": prompt}]
+                if image_data:
+                    b64_image = base64.b64encode(image_data).decode('utf-8')
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": b64_image
+                        }
+                    })
+                
+                payload = {
+                    "contents": [{"parts": parts}],
+                    "generationConfig": {
+                         "temperature": 1.0 if image_data else 1.2,
+                         "topP": 0.95,
+                         "topK": 40,
+                         "maxOutputTokens": 8192,
+                         "candidateCount": 1
+                    }
+                }
+
+                # Special handling for thinking model if needed via HTTP? 
+                # Assuming custom providers might not need specific thinking config or support it differently.
+                # Adding it blindly might break some proxies. Omitting for now unless requested.
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            raise Exception(f"HTTP {resp.status}: {text}")
+                            
+                        data = await resp.json()
+                        # Unpack response
+                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+                        try:
+                            return data['candidates'][0]['content']['parts'][0]['text']
+                        except (KeyError, IndexError):
+                            return "" # Or raise error
+
+            except Exception as e:
+                self.logger.warning(f"Key {key[:5]}... failed: {str(e)}")
+                retries += 1
+                
+        raise Exception(f"All keys failed for provider {self.name}")
+
+class ProviderManager:
+    def __init__(self, providers_config: Dict, safety_settings: List):
+        self.logger = logging.getLogger("ProviderManager")
+        self.providers = {}
+        self.provider_order = providers_config.get('settings', {}).get('provider_order', [])
+        
+        # Initialize providers
+        p_configs = providers_config.get('providers', {})
+        for p_name, p_cfg in p_configs.items():
+            try:
+                p_type = p_cfg.get('type')
+                if p_type == 'official':
+                    self.providers[p_name] = OfficialProvider(p_name, p_cfg, safety_settings)
+                elif p_type == 'custom':
+                    self.providers[p_name] = CustomProvider(p_name, p_cfg)
+                self.logger.info(f"Initialized provider: {p_name} ({p_type})")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize provider {p_name}: {str(e)}")
+        
+        # Filter order to only existing providers
+        self.provider_order = [p for p in self.provider_order if p in self.providers]
+        if not self.provider_order and self.providers:
+            # If no order specified but providers exist, add them arbitrarily
+            self.provider_order = list(self.providers.keys())
+
+    async def generate_with_fallback(self, prompt: str, image_data: bytes = None) -> str:
+        """Try all providers in order"""
+        if not self.providers:
+             raise Exception("No providers configured")
+
+        errors = []
+        
+        for provider_name in self.provider_order:
+            provider = self.providers[provider_name]
+            self.logger.info(f"Using provider: {provider_name}")
+            
+            # Try all models in this provider
+            for model_cfg in provider.models_config:
+                model_name = model_cfg['name']
+                try:
+                    result = await provider.generate_content(model_name, prompt, image_data)
+                    if result:
+                         return result
+                except Exception as e:
+                    self.logger.warning(f"Provider {provider_name} model {model_name} failed: {str(e)}")
+                    errors.append(f"{provider_name}/{model_name}: {str(e)}")
+                    continue
+            
+            # If we are here, means this provider failed all models/keys.
+            # Send webhook notification if there is a next provider
+            is_last = (provider_name == self.provider_order[-1])
+            if not is_last and ERROR_WEBHOOK_URL:
+                 next_provider = self.provider_order[self.provider_order.index(provider_name) + 1]
+                 asyncio.create_task(self._send_fallback_webhook(provider_name, next_provider))
+        
+        raise Exception(f"All providers failed. Errors: {'; '.join(errors)}")
+
+    async def _send_fallback_webhook(self, failed_provider: str, next_provider: str):
+        try:
+             async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(ERROR_WEBHOOK_URL, session=session)
+                embed = discord.Embed(
+                    title="⚠️ Provider Fallback",
+                    description=f"Provider **{failed_provider}** exhausted (keys/rate limits). Switching to **{next_provider}**.",
+                    color=0xFFA500 # Orange
+                )
+                embed.set_footer(text=f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                await webhook.send(embed=embed)
+        except Exception as e:
+            self.logger.error(f"Failed to send fallback webhook: {str(e)}")
 
 class Translator:
     def __init__(self):
         """initialize translator"""
         self.logger = logging.getLogger(self.__class__.__name__)
-        self._setup_rate_limits()
         
-        self.api_keys = GEMINI_API_KEYS.copy()
-        if not self.api_keys:
-            self.logger.error("No API keys configured. Please set GEMINI_API_KEYS in environment variables.")
-            raise ValueError("No API keys configured")
-        
-        self.setup_models()
+        # Load configs
         self.translation_dict_path = 'translation_dictionary.json'
         self.skip_keywords_path = 'skip_keywords.json'
         self.translation_dict = self.load_translation_dictionary()
         self.skip_keywords = self.load_skip_keywords()
-
-    def _setup_rate_limits(self):
-        """Set rate limit parameters"""
-        self.request_semaphore = Semaphore(2)
-        self.last_request_time = 0
-        self.min_request_interval = 0.5
-        self.max_retries = 3  
-
-    def setup_models(self):
-        """Initialize Gemini models, try available API keys in order"""
         
-
-        # Convert safety settings from config to the required type
+        # Setup safety settings for OfficialProvider
         self.safety_settings = [
             types.SafetySetting(
                 category=types.HarmCategory[setting["category"]],
@@ -48,45 +311,9 @@ class Translator:
             )
             for setting in SAFETY_SETTINGS
         ]
-
-        try:
-            initialization_errors = []
-            for key in self.api_keys:
-                try:
-                    # Initialize the client with the current key
-                    client = genai.Client(api_key=key)
-                    
-                    # Test if the key is available by making a simple call
-                    test_response = client.models.generate_content(
-                        model="models/gemini-2.0-flash",
-                        contents=["Test connection."],
-                        config=types.GenerateContentConfig(
-                            safety_settings=self.safety_settings
-                        )
-                    )
-
-                    # If successful, set model names and confirm initialization
-                    self.main_model_name = 'gemini-2.5-flash'
-                    self.fallback_model_name = 'gemini-2.0-flash'
-                    
-                    self.logger.info(f"API key pool validated successfully.")
-                    return
-                    
-                except Exception as e:
-                    error_msg = f"Failed to initialize with a key: {str(e)}"
-                    initialization_errors.append(error_msg)
-                    self.logger.warning(error_msg)
-                    continue
-            
-            # If all keys fail
-            error_details = "\n".join(initialization_errors)
-            error_msg = f"Failed to initialize client with any API key. Errors:\n{error_details}"
-            self.logger.error(error_msg)
-            raise Exception(error_msg)
-
-        except Exception as e:
-            self.logger.error(f"Failed to set up models: {str(e)}")
-            raise
+        
+        # Initialize ProviderManager
+        self.manager = ProviderManager(PROVIDERS_CONFIG, self.safety_settings)
 
     def load_translation_dictionary(self):
         """Load translation dictionary"""
@@ -202,29 +429,20 @@ class Translator:
             try:
                 # Build full prompt
                 prompt = TRANSLATION_PROMPT.format(**format_params)
-                self.logger.debug(f"Built translation prompt: {prompt}")
             except KeyError as ke:
                 self.logger.error(
                     f"TRANSLATION_PROMPT formatting error: {ke}, parameter details: {format_params}"
                 )
                 raise Exception(f"Translation prompt formatting error: {ke}")
             
-            async with aiohttp.ClientSession() as session:
-                # Try main model
-                result = await self._try_model(self.main_model_name, prompt)
-                
-                if result:
-                    return result
-                
-                # If main model fails, try fallback model
-                self.logger.warning("Primary model failed, switching to fallback model")
-                result = await self._try_model(self.fallback_model_name, prompt)
-                
-                if result:
-                    return result
-                
-                self.logger.error("Both primary and fallback models failed in text translation")
-                raise Exception("Both primary and fallback models failed in text translation")
+            # Use Manager to execute
+            result_text = await self.manager.generate_with_fallback(prompt)
+            
+            if result_text:
+                 # Parse the result
+                return self._parse_translation_response(result_text, is_image=False)
+            
+            raise Exception("Translation returned empty result")
                     
         except Exception as e:
             self.logger.error(
@@ -244,31 +462,23 @@ class Translator:
                 # 1. Download and preprocess image
                 image = await self._download_and_process_image(image_url, session)
                 
-                # 2. Prepare model input
+                # 2. Prepare prompt
                 prompt = IMAGE_TRANSLATION_PROMPT.format(
                     target_lang=target_lang,
                     glossary_rules=self._build_glossary_prompt(),
                     skip_keywords=", ".join(self.skip_keywords)
                 )
-                # Convert image to bytes and prepare for API
+                # Convert image to bytes
                 buffer = io.BytesIO()
                 image.save(buffer, format='JPEG', quality=95)
                 image_bytes = buffer.getvalue()
-                image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg')
                 
-                # 3. Try main model
-                result = await self._try_model(self.main_model_name, prompt, additional_data=image_part)
-                if result:
-                    return result
+                # 3. Use Manager to execute
+                result_text = await self.manager.generate_with_fallback(prompt, image_data=image_bytes)
                 
-                # 4. Try fallback model
-                self.logger.info("Primary model failed, trying fallback model")
-                result = await self._try_model(self.fallback_model_name, prompt, additional_data=image_part)
-                
-                if result:
-                    return result
-                
-                self.logger.error("Both primary and fallback models failed in image translation")
+                if result_text:
+                    return self._parse_translation_response(result_text, is_image=True)
+
                 return None
     
         except Exception as e:
@@ -293,137 +503,6 @@ class Translator:
         except Exception as e:
             self.logger.error(f"Failed to download and process image: {str(e)}")
             raise
-
-    async def _try_model(self, model_name: str, prompt: str, additional_data: Optional[types.Part] = None) -> Optional[Dict]:
-        """Generic model attempt method"""
-        try:
-            self.logger.info(f"Attempting translation with model: {model_name}")
-            if additional_data:
-                self.logger.debug(f"Sending additional data...")
-
-            # Set temperature and base generation config
-            gen_config_params = {}
-            if additional_data:
-                gen_config_params.update({
-                    "candidate_count": 1,
-                    "temperature": 1.0,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 8192,
-                })
-            else:
-                gen_config_params.update({
-                    "candidate_count": 1,
-                    "temperature": 1.2,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 8192,
-                })
-
-            # Prepare contents
-            contents = [prompt, additional_data] if additional_data else [prompt]
-
-            async def generate_content_call(client):
-                # Specific config for gemini-2.5-flash
-                if model_name == 'gemini-2.5-flash':
-                    config = types.GenerateContentConfig(
-                        **gen_config_params,
-                        safety_settings=self.safety_settings,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0)
-                    )
-                else:
-                    # For other models, do not include thinking_config
-                    config = types.GenerateContentConfig(
-                        **gen_config_params,
-                        safety_settings=self.safety_settings
-                    )
-
-                partial_func = functools.partial(
-                    client.models.generate_content,
-                    model=f"models/{model_name}",
-                    contents=contents,
-                    config=config
-                )
-                
-                loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(None, partial_func)
-
-            response = await self._rate_limited_request(generate_content_call)
-
-            # Add raw response log
-            self.logger.debug(f"Raw Gemini response: {response}")
-
-            if response.prompt_feedback and response.prompt_feedback.block_reason:
-                self.logger.warning(
-                    f"Translation blocked: {response.prompt_feedback.block_reason}, "
-                    f"Model: {model_name}, "
-                    f"Full feedback: {response.prompt_feedback}"
-                )
-                return None
-
-            result_text = response.text if hasattr(response, 'text') else str(response)
-            self.logger.info(f"Translation successful with model: {model_name}")
-            return self._parse_translation_response(result_text, is_image=bool(additional_data))
-
-        except Exception as e:
-            self.logger.error(
-                f"Model translation failed: {str(e)}，模型: {model_name}",
-                exc_info=True
-            )
-            return None
-
-    async def _rate_limited_request(self, coro_func):
-        """Use semaphore and time interval to limit request rate"""
-        retry_count = 0
-        last_error = None
-        
-        while retry_count < self.max_retries:
-            async with self.request_semaphore:
-                current_time = asyncio.get_running_loop().time()
-                time_since_last = current_time - self.last_request_time
-                if time_since_last < self.min_request_interval:
-                    self.logger.info(
-                        f"Waiting {self.min_request_interval - time_since_last:.2f} seconds to meet minimum request interval"
-                    )
-                    await asyncio.sleep(self.min_request_interval - time_since_last)
-                
-                available_keys = self.api_keys.copy()
-                while available_keys:
-                    selected_key = random.choice(available_keys)
-                    try:
-                        request_client = genai.Client(api_key=selected_key)
-                        self.last_request_time = asyncio.get_running_loop().time()
-                        return await coro_func(client=request_client)
-    
-                    except Exception as e:
-                        last_error = e
-                        if "429" in str(e):
-                            available_keys.remove(selected_key)
-                            self.logger.warning(f"API key rate limit reached, switching to another key... ({len(available_keys)} remaining)")
-                            if not available_keys:
-                                break
-                        elif "API key" in str(e) and ("not found" in str(e) or "invalid" in str(e)):
-                            available_keys.remove(selected_key)
-                            self.logger.error(f"Invalid API key removed from pool temporarily. ({len(available_keys)} remaining)")
-                            if not available_keys:
-                                raise ValueError("No valid API keys available") from e
-                        else:
-                            self.logger.error(
-                                f"Unexpected error occurred during request: {str(e)}",
-                                exc_info=True
-                            )
-                            raise
-                
-            retry_count += 1
-            if retry_count < self.max_retries:
-                wait_time = min(2 ** retry_count, 3)  # Exponential backoff, max wait 3 seconds
-                self.logger.warning(f"All keys rate limited. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{self.max_retries})")
-                await asyncio.sleep(wait_time)
-        
-        self.logger.error(
-            f"Reached maximum retry count ({self.max_retries}) in _rate_limited_request, last error: {str(last_error)}"
-        )
-        raise Exception(f"Reached maximum retry count ({self.max_retries}). Last error: {str(last_error)}")
 
     def _parse_translation_response(self, response, is_image: bool = False) -> Dict:
         """Uniform response parsing function"""

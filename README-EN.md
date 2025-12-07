@@ -14,6 +14,15 @@
 
 Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can translate text, images, and embed messages in real-time within specified channels.<br>Adapted to Discord's features, it segments and returns the original text, translation, and annotations for easy copy-pasting.
 
+## 📅**Update Log**
+
+### **2024-12-08: Multi-Provider Support**
+- **Multi-Provider Architecture:** Added `providers.json` configuration to support both official Google Gemini API and custom third-party APIs simultaneously.
+- **Config Migration:** Deprecated `GEMINI_API_KEYS` in `.env`. All API keys are now managed centrally in `providers.json`.
+- **Custom Providers:** Support for any Gemini-compatible third-party provider via raw HTTP requests.
+- **Smart Fallback:** Configure multiple providers with priority. If the primary provider (e.g., Official) fails or hits rate limits, the bot automatically switches to the backup provider and sends a webhook notification.
+- **Granular Control:** Configure RPM (Requests Per Minute) limits individually for different models and providers.
+
 ## 💡**Key Features**
 
 ### **1. Slash Commands**
@@ -30,7 +39,7 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
 ### **3. Optimized Load Balancing**
 
-- **Dual-Model Auto-Switching:** Automatically switches to the backup model `gemini-2.0-flash` if the primary model `gemini-2.5-flash` fails.
+- **Dual-Model Auto-Switching:** Automatically switches to the backup model `gemini-2.5-flash-lite` if the primary model `gemini-2.5-flash` fails.
 - **Smart Rate Limiting:** Randomly rotates multiple API keys, with built-in rate limiting and retry strategies to avoid 429 errors.
 - **Adaptive Concurrency Control:** Built-in message deduplication and caching mechanisms, with an asynchronous message queue ensuring Discord messages are processed in the order they were sent.
 - **Automatic Log Rotation & Cleanup:** Logs older than 7 days are automatically cleaned up, and log files are rotated daily to maintain system efficiency.
@@ -66,8 +75,6 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
     # Your Discord bot token
     DISCORD_TOKEN=MAAAAAAA.GBBBBBBB.RCCCCCCCCCCCCCCCCCCCCCCCC-ng
           
-    # Gemini API key(s); filling at least one is sufficient
-    GEMINI_API_KEYS=A0000000_V111111111111111,A0000000_V222222222222222,A0000000_V333333333333333....
 
     # Webhook URL for receiving error notifications
     ERROR_WEBHOOK_URL=https://discord.com/api/webhooks/000000000000/aaaaaaBBBBBBBBBBBcccccccDDDDDDR
@@ -86,6 +93,43 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
     LOG_LEVEL_FILE=INFO
     LOG_LEVEL_CONSOLE=INFO
     ```
+
+- **Configure `providers.json` (New Core Configuration)**
+    
+    The bot will automatically generate a `providers.json` template in the root directory upon first run. You need to configure your API keys and provider information here.
+
+    **Configuration Example:**
+
+    ```json
+    {
+        "settings": {
+            "provider_order": ["official", "my_custom_provider"] // Priority order
+        },
+        "providers": {
+            "official": {
+                "type": "official", // Official Google SDK
+                "api_keys": [ "OFFICIAL_KEY_1", "OFFICIAL_KEY_2" ],
+                "models": [ 
+                    { "name": "gemini-2.5-flash", "rpm": 5 },
+                    { "name": "gemini-2.5-flash-lite", "rpm": 10 }
+                ]
+            },
+            "my_custom_provider": {
+                "type": "custom", // Custom HTTP Provider
+                "base_url": "https://api.third-party.com", // Custom Base URL, no slash in the end
+                "api_keys": [ "CUSTOM_KEY_1" ],
+                "models": [
+                    { "name": "gemini-2.5-flash", "rpm": 60 } // Custom RPM
+                ]
+            }
+        }
+    }
+    ```
+
+    - **`type`**: `official` (SDK) or `custom` (For custom providers. Must support the Gemini native format).
+    - **`base_url`**: API endpoint for custom providers (required for `custom` type).
+    - **`rpm`**: Requests Per Minute limit. The bot will automatically handle rate limiting based on this value.
+
     
 - **Run the Bot**
     
