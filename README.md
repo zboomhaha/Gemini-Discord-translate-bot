@@ -15,6 +15,13 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 
 ## 📅**更新日志**
 
+### **2025-03-05: Fallback 机制重构**
+- **智能错误分级处理：** 根据 HTTP 状态码精细化处理不同错误类型：503（模型过载）立即切换 Model 并进入 5 分钟 Cooldown；429（配额超限）随机换 Key 重试；400/403（Key 失效）自动禁用 Key 并发送 Webhook 通知管理员。
+- **Per-Key RPM 限制：** RPM 速率限制从 Provider 级别细化至单个 Key 级别，多 Key 之间不再互相干扰速率。
+- **随机 Key 选择：** 放弃固定轮询，改为随机选取可用 Key，避免热点。
+- **双层超时保护：** 单次 API 调用超时 10 秒（快速切换 Key/Model）；单条消息整体处理超时 90 秒（防止队列阻塞），超时时自动发送错误 Webhook，若为 DM 消息则同时向用户回复"服务繁忙中，请稍后重试"。
+- **Key 尝试日志：** 每次 Key 切换均记录详细日志（第 X/3 次尝试），提升可观测性。
+
 ### **2025-12-08: Multi-Provider Support**
 - **多服务商支持：** 新增 `providers.json` 配置文件，支持同时配置官方 Gemini API 和自定义中转 API。
 - **配置迁移：** 废弃 `.env` 中的 `GEMINI_API_KEYS`，所有 API Key 统一管理在 `providers.json` 中。
@@ -38,8 +45,10 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 
 ### **3. 负载均衡优化**
 
-- **双模型自动切换：** 主模型`gemini-2.5-flash`失败时自动切换到备用模型`gemini-2.5-flash-lite`。
-- **智能速率限制：** 随机轮换多个API 密钥、内置请求速率限制与重试策略，避免429。
+- **三层 Fallback 机制：** Key 失败 → 随机换 Key（最多 3 次）→ Model Cooldown 切换备用 Model → Provider Fallback 切换备用服务商。
+- **智能错误分级：** 503 立即触发 5 分钟 Model Cooldown；429 随机换 Key 重试；400/403 自动禁用 Key 并发送 Webhook 告警（附带 Key 信息）。
+- **Per-Key RPM 限速：** RPM 配置作用于单个 Key，多 Key 并行时速率互不干扰。
+- **双层超时保护：** 单次 API 调用 10 秒超时；单条消息整体 90 秒超时，超时自动通知管理员，DM 用户同步收到忙碌提示。
 - **自适应并发控制：** 内置消息去重与缓存机制，异步消息队列可确保频道内的Discord消息按发送顺序处理。
 - **自动轮转和清理日志：** 日志文件每日自动轮转，自动清理超过7天的日志记录。
 
@@ -134,7 +143,7 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 
     - **`type`**: `official` (官方SDK) 或 `custom` (第三方接口，必须支持Gemini原生格式)。
     - **`base_url`**: 自定义服务商的 API 地址（仅 `custom` 类型需要）。
-    - **`rpm`**: 每分钟请求数限制，机器人会根据此值自动进行速率控制。
+    - **`rpm`**: 每分钟请求数限制（Per Key），机器人会根据此值对每个 Key 独立进行速率控制，多 Key 之间速率互不干扰。
 
     
 - **运行bot**

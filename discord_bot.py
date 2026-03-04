@@ -488,15 +488,28 @@ class TranslatorBot(commands.Bot):
             message_key = f"{message.channel.id}:{message.id}"
             self._message_cache[message_key] = time.time()
             
-            # Process referenced message
-            referenced_message = await self.fetch_referenced_message(message)
-            if referenced_message:
-                ref_processed = await self.process_translated_content(referenced_message, target_channel)
-                message_processed = message_processed or ref_processed
+            # Process translations with timeout protection (90 seconds)
+            async def _do_translation():
+                _processed = False
+                referenced_message = await self.fetch_referenced_message(message)
+                if referenced_message:
+                    ref_result = await self.process_translated_content(referenced_message, target_channel)
+                    _processed = _processed or ref_result
+                cur_result = await self.process_translated_content(message, target_channel)
+                _processed = _processed or cur_result
+                return _processed
             
-            # Process current message
-            current_processed = await self.process_translated_content(message, target_channel)
-            message_processed = message_processed or current_processed
+            try:
+                message_processed = await asyncio.wait_for(_do_translation(), timeout=90)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Message {message.id} processing timed out (90s)")
+                await self.send_error_message(f"消息处理超时 (Message ID: {message.id})")
+                if is_dm:
+                    try:
+                        await message.channel.send("服务繁忙中，请稍后重试")
+                    except Exception as dm_e:
+                        self.logger.error(f"Failed to send timeout message to DM: {str(dm_e)}")
+                return False
             
             is_successful_run = message_processed
             if is_successful_run:
@@ -890,7 +903,7 @@ class TranslatorBot(commands.Bot):
                 await channel.send(content=titles["notes"])
                 # Then send notes content (without Notes: prefix)
                 sent_message = await channel.send(f"*{cleaned_notes}*")
-                self.logger.info(f"Sent notes to channel {channel.name}: {cleaned_notes}")
+                self.logger.info(f"Sent notes to channel {channel_name}: {cleaned_notes}")
 
         except discord.errors.HTTPException as e:
             if e.code == 50035:  # Message length error

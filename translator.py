@@ -12,7 +12,14 @@ from typing import Dict, Optional, List
 from PIL import Image
 from datetime import datetime
 import discord
+import time
 from config import PROVIDERS_CONFIG, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAULT_TARGET_LANG, IMAGE_TRANSLATION_PROMPT, EMPTY_INDICATORS, ERROR_WEBHOOK_URL
+
+
+class ModelCooldownError(Exception):
+    """Raised when model should enter cooldown (e.g., 503)"""
+    pass
+
 
 class BaseProvider:
     """Abstract base class for translation providers"""
@@ -23,27 +30,32 @@ class BaseProvider:
         self.api_keys = config.get('api_keys', [])
         # models config: [{"name": "model_name", "rpm": 5}, ...]
         self.models_config = config.get('models', [])
-        self.current_key_idx = 0
         
-        # Initialize Rate Limiters for each model
-        # Map: model_name -> {"semaphore": Semaphore, "last_calls": [timestamps], "rpm": int}
+        # Per-(model, key) rate limiters for per-key RPM control
         self.rate_limiters = {}
         for model_cfg in self.models_config:
             model_name = model_cfg['name']
             rpm = model_cfg.get('rpm', 5)
-            self.rate_limiters[model_name] = {
-                "semaphore": Semaphore(1), # Concurrency lock mainly for rate limit check
-                "last_call_time": 0,
-                "interval": 60.0 / rpm if rpm > 0 else 0,
-                "rpm": rpm
-            }
+            for key in self.api_keys:
+                self.rate_limiters[(model_name, key)] = {
+                    "semaphore": Semaphore(1),
+                    "last_call_time": 0,
+                    "interval": 60.0 / rpm if rpm > 0 else 0,
+                    "rpm": rpm
+                }
+        
+        # Model cooldown tracking: model_name -> cooldown_until (timestamp)
+        self.model_cooldowns = {}
+        
+        # Disabled keys (invalid/expired), persists within session
+        self.disabled_keys = set()
             
     async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
         raise NotImplementedError
 
-    async def _check_rate_limit(self, model_name: str):
-        """Enforce RPM limit"""
-        limiter = self.rate_limiters.get(model_name)
+    async def _check_rate_limit(self, model_name: str, key: str):
+        """Enforce per-key RPM limit"""
+        limiter = self.rate_limiters.get((model_name, key))
         if not limiter:
             return
             
@@ -53,18 +65,43 @@ class BaseProvider:
             
             if time_since_last < limiter["interval"]:
                 wait_time = limiter["interval"] - time_since_last
-                self.logger.debug(f"Rate limit: Waiting {wait_time:.2f}s for model {model_name}")
+                self.logger.debug(f"Rate limit: Waiting {wait_time:.2f}s for {model_name} key {key[:8]}...")
                 await asyncio.sleep(wait_time)
             
             limiter["last_call_time"] = asyncio.get_running_loop().time()
 
-    def _get_next_key(self) -> Optional[str]:
-        """Round-robin key selection"""
-        if not self.api_keys:
-            return None
-        key = self.api_keys[self.current_key_idx]
-        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
-        return key
+    def _get_available_keys(self) -> list:
+        """Get keys that are not disabled"""
+        return [k for k in self.api_keys if k not in self.disabled_keys]
+
+    def _check_model_cooldown(self, model_name: str):
+        """Check if model is in cooldown, raise ModelCooldownError if so"""
+        if model_name in self.model_cooldowns:
+            if time.time() < self.model_cooldowns[model_name]:
+                remaining = int(self.model_cooldowns[model_name] - time.time())
+                raise ModelCooldownError(
+                    f"Model {model_name} is in cooldown ({remaining}s remaining)"
+                )
+            else:
+                del self.model_cooldowns[model_name]
+
+    async def _send_key_error_webhook(self, key: str, error_msg: str):
+        """Send error webhook for invalid/expired key"""
+        try:
+            if not ERROR_WEBHOOK_URL:
+                return
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(ERROR_WEBHOOK_URL, session=session)
+                embed = discord.Embed(
+                    title="🔑 API Key Error",
+                    description=f"Provider **{self.name}** key `{key[:12]}...` is invalid/expired.\n\nError: {error_msg[:500]}",
+                    color=0xFF0000
+                )
+                embed.set_footer(text=f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                await webhook.send(embed=embed)
+                self.logger.info(f"Key error webhook sent for key {key[:8]}...")
+        except Exception as e:
+            self.logger.error(f"Failed to send key error webhook: {str(e)}")
 
 class OfficialProvider(BaseProvider):
     """Provider for Google Official SDK (google-genai)"""
@@ -73,30 +110,35 @@ class OfficialProvider(BaseProvider):
         self.safety_settings = safety_settings
         
     async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
-        # Retry with different keys if needed, but for now we follow simple logic:
-        # One request per call, but if we want to handle key rotation on error, we do it here.
-        # We try up to len(keys) times or 3 times max.
+        # Check model cooldown first
+        self._check_model_cooldown(model_name)
         
-        max_retries = len(self.api_keys) if self.api_keys else 1
-        retries = 0
+        available_keys = self._get_available_keys()
+        if not available_keys:
+            raise Exception(f"No available API keys for provider {self.name}")
         
-        while retries < max_retries:
-            key = self._get_next_key()
-            if not key:
-                raise ValueError("No API keys configured for official provider")
-                
+        max_retries = min(3, len(available_keys))
+        tried_keys = set()
+        
+        for attempt in range(max_retries):
+            remaining = [k for k in available_keys if k not in tried_keys]
+            if not remaining:
+                break
+            key = random.choice(remaining)
+            tried_keys.add(key)
+            
+            self.logger.info(f"Trying key {key[:8]}... ({attempt + 1}/{max_retries}) for model {model_name}")
+            
             try:
-                await self._check_rate_limit(model_name)
+                await self._check_rate_limit(model_name, key)
                 
                 client = genai.Client(api_key=key)
                 
                 contents = [prompt]
                 if image_data:
-                    # Official SDK expects 'image/jpeg' part
                     image_part = types.Part.from_bytes(data=image_data, mime_type='image/jpeg')
                     contents.append(image_part)
                 
-                # Configuration logic similar to original
                 gen_config_params = {
                     "candidate_count": 1,
                     "top_p": 0.95,
@@ -122,7 +164,7 @@ class OfficialProvider(BaseProvider):
                         safety_settings=self.safety_settings
                     )
 
-                # Execute in executor to avoid blocking
+                # Execute in executor with 10s timeout per API call
                 partial_func = functools.partial(
                     client.models.generate_content,
                     model=f"models/{model_name}",
@@ -130,7 +172,14 @@ class OfficialProvider(BaseProvider):
                     config=config
                 )
                 loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(None, partial_func)
+                try:
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(None, partial_func),
+                        timeout=10
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"API call timed out (10s) for key {key[:8]}... model {model_name}")
+                    raise Exception(f"API call timeout (10s) for model {model_name}")
                 
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
                     self.logger.warning(f"Blocked: {response.prompt_feedback}")
@@ -138,18 +187,36 @@ class OfficialProvider(BaseProvider):
                     
                 return response.text if hasattr(response, 'text') else str(response)
 
+            except ModelCooldownError:
+                raise  # Re-raise cooldown errors
             except Exception as e:
-                self.logger.warning(f"Key {key[:5]}... failed: {str(e)}")
-                retries += 1
-                if "429" in str(e):
-                    continue # Rate limit, try next key
-                if "API key" in str(e) and ("invalid" in str(e) or "not found" in str(e)):
-                     # Could remove key effectively here
-                     continue
-                # For other errors, maybe we still want to try next key?
-                # Let's be aggressive and try next key.
+                error_str = str(e)
+                self.logger.warning(f"Key {key[:8]}... failed ({attempt + 1}/{max_retries}): {error_str}")
+                
+                # 503 - Model overloaded, cooldown entire model immediately
+                if "503" in error_str or "UNAVAILABLE" in error_str:
+                    self.model_cooldowns[model_name] = time.time() + 300
+                    self.logger.warning(f"Model {model_name} received 503, entering cooldown for 5 minutes")
+                    raise ModelCooldownError(f"Model {model_name} unavailable (503), cooldown 5min")
+                
+                # 429 - Key rate limited, try next key
+                elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    continue
+                
+                # 400/403 - Check if key-related error
+                elif ("API_KEY_INVALID" in error_str or "API key expired" in error_str 
+                      or "API key not valid" in error_str
+                      or ("403" in error_str and "PERMISSION_DENIED" in error_str)):
+                    self.disabled_keys.add(key)
+                    self.logger.error(f"Key {key[:8]}... marked as disabled (invalid/expired)")
+                    asyncio.create_task(self._send_key_error_webhook(key, error_str))
+                    continue
+                
+                # Other errors - try next key
+                else:
+                    continue
         
-        raise Exception(f"All keys failed for provider {self.name}")
+        raise Exception(f"All attempted keys failed for provider {self.name}")
 
 class CustomProvider(BaseProvider):
     """Provider for Custom Base URL (Raw HTTP)"""
@@ -160,18 +227,29 @@ class CustomProvider(BaseProvider):
             raise ValueError(f"No base_url configured for custom provider {name}")
             
     async def generate_content(self, model_name: str, prompt: str, image_data: bytes = None) -> Optional[str]:
-        max_retries = len(self.api_keys) if self.api_keys else 1
-        retries = 0
+        # Check model cooldown first
+        self._check_model_cooldown(model_name)
+        
+        available_keys = self._get_available_keys()
+        if not available_keys:
+            raise Exception(f"No available API keys for provider {self.name}")
+        
+        max_retries = min(3, len(available_keys))
+        tried_keys = set()
         
         import base64
         
-        while retries < max_retries:
-            key = self._get_next_key()
-            if not key:
-                raise ValueError(f"No API keys configured for provider {self.name}")
-                
+        for attempt in range(max_retries):
+            remaining = [k for k in available_keys if k not in tried_keys]
+            if not remaining:
+                break
+            key = random.choice(remaining)
+            tried_keys.add(key)
+            
+            self.logger.info(f"Trying key {key[:8]}... ({attempt + 1}/{max_retries}) for model {model_name}")
+            
             try:
-                await self._check_rate_limit(model_name)
+                await self._check_rate_limit(model_name, key)
                 
                 url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
                 
@@ -196,30 +274,45 @@ class CustomProvider(BaseProvider):
                          "candidateCount": 1
                     }
                 }
-
-                # Special handling for thinking model if needed via HTTP? 
-                # Assuming custom providers might not need specific thinking config or support it differently.
-                # Adding it blindly might break some proxies. Omitting for now unless requested.
                 
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(url, json=payload) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            raise Exception(f"HTTP {resp.status}: {text}")
-                            
-                        data = await resp.json()
-                        # Unpack response
-                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-                        try:
-                            return data['candidates'][0]['content']['parts'][0]['text']
-                        except (KeyError, IndexError):
-                            return "" # Or raise error
+                        if resp.status == 200:
+                            data = await resp.json()
+                            try:
+                                return data['candidates'][0]['content']['parts'][0]['text']
+                            except (KeyError, IndexError):
+                                return ""
+                        
+                        # Handle error responses by status code
+                        error_text = await resp.text()
+                        
+                        if resp.status == 503:
+                            self.model_cooldowns[model_name] = time.time() + 300
+                            self.logger.warning(f"Model {model_name} received 503, entering cooldown for 5 minutes")
+                            raise ModelCooldownError(f"Model {model_name} unavailable (503), cooldown 5min")
+                        
+                        elif resp.status == 429:
+                            self.logger.warning(f"Key {key[:8]}... rate limited (429)")
+                            raise Exception(f"HTTP 429: {error_text[:200]}")
+                        
+                        elif resp.status in (400, 403):
+                            self.disabled_keys.add(key)
+                            self.logger.error(f"Key {key[:8]}... marked as disabled (HTTP {resp.status})")
+                            asyncio.create_task(self._send_key_error_webhook(key, f"HTTP {resp.status}: {error_text[:300]}"))
+                            raise Exception(f"HTTP {resp.status}: {error_text[:200]}")
+                        
+                        else:
+                            raise Exception(f"HTTP {resp.status}: {error_text[:200]}")
 
+            except ModelCooldownError:
+                raise  # Re-raise cooldown errors
             except Exception as e:
-                self.logger.warning(f"Key {key[:5]}... failed: {str(e)}")
-                retries += 1
+                self.logger.warning(f"Key {key[:8]}... failed ({attempt + 1}/{max_retries}): {str(e)}")
+                continue
                 
-        raise Exception(f"All keys failed for provider {self.name}")
+        raise Exception(f"All attempted keys failed for provider {self.name}")
 
 class ProviderManager:
     def __init__(self, providers_config: Dict, safety_settings: List):
@@ -247,7 +340,7 @@ class ProviderManager:
             self.provider_order = list(self.providers.keys())
 
     async def generate_with_fallback(self, prompt: str, image_data: bytes = None) -> str:
-        """Try all providers in order"""
+        """Try all providers in order, with model and provider fallback"""
         if not self.providers:
              raise Exception("No providers configured")
 
@@ -264,13 +357,17 @@ class ProviderManager:
                     result = await provider.generate_content(model_name, prompt, image_data)
                     if result:
                          return result
+                except ModelCooldownError as e:
+                    # Model is in cooldown (503), skip to next model
+                    self.logger.warning(f"Provider {provider_name} model {model_name} cooldown: {str(e)}")
+                    errors.append(f"{provider_name}/{model_name}: {str(e)}")
+                    continue
                 except Exception as e:
                     self.logger.warning(f"Provider {provider_name} model {model_name} failed: {str(e)}")
                     errors.append(f"{provider_name}/{model_name}: {str(e)}")
                     continue
             
-            # If we are here, means this provider failed all models/keys.
-            # Send webhook notification if there is a next provider
+            # Provider failed all models/keys, send fallback webhook
             is_last = (provider_name == self.provider_order[-1])
             if not is_last and ERROR_WEBHOOK_URL:
                  next_provider = self.provider_order[self.provider_order.index(provider_name) + 1]
@@ -314,6 +411,9 @@ class Translator:
         
         # Initialize ProviderManager
         self.manager = ProviderManager(PROVIDERS_CONFIG, self.safety_settings)
+        
+        # Suppress AFC (Automatic Function Calling) INFO logs
+        logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
     def load_translation_dictionary(self):
         """Load translation dictionary"""

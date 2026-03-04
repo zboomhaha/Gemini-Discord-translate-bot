@@ -16,6 +16,13 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
 ## 📅**Update Log**
 
+### **2025-03-05: Fallback Mechanism Refactor**
+- **Intelligent Error Classification:** HTTP status codes now determine fallback behavior: 503 (model overloaded) immediately skips the model and enters a 5-minute cooldown; 429 (quota exhausted) retries with a randomly selected key; 400/403 (invalid key) automatically disables the key and sends a webhook alert to the admin.
+- **Per-Key RPM Limiting:** RPM limits are now enforced per individual key, so multiple keys operate at full capacity independently without interfering with each other.
+- **Random Key Selection:** Replaced fixed round-robin polling with random key selection to avoid hotspots.
+- **Two-Layer Timeout Protection:** Each API call has a 10-second timeout (for fast key/model switching); each message has an overall 90-second processing timeout (to prevent queue blocking). On timeout, an error webhook is sent, and DM users receive a "Service busy, please try again later" reply.
+- **Key Attempt Logging:** Each key switch is logged in detail (attempt X/3), improving observability.
+
 ### **2024-12-08: Multi-Provider Support**
 - **Multi-Provider Architecture:** Added `providers.json` configuration to support both official Google Gemini API and custom third-party APIs simultaneously.
 - **Config Migration:** Deprecated `GEMINI_API_KEYS` in `.env`. All API keys are now managed centrally in `providers.json`.
@@ -39,8 +46,10 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
 ### **3. Optimized Load Balancing**
 
-- **Dual-Model Auto-Switching:** Automatically switches to the backup model `gemini-2.5-flash-lite` if the primary model `gemini-2.5-flash` fails.
-- **Smart Rate Limiting:** Randomly rotates multiple API keys, with built-in rate limiting and retry strategies to avoid 429 errors.
+- **Three-Layer Fallback:** Key failure → Retry with random key (up to 3 attempts) → Model Cooldown → Switch to backup model → Provider Fallback to next provider.
+- **Intelligent Error Classification:** 503 triggers a 5-minute model cooldown; 429 retries with a different key; 400/403 disables the key and sends a webhook alert with key details.
+- **Per-Key RPM Limiting:** RPM limits are enforced per individual key, so multiple keys run at full capacity independently.
+- **Two-Layer Timeout Protection:** 10-second per-call timeout for fast failover; 90-second per-message timeout to prevent queue blocking. Admins are notified on timeout, and DM users receive a busy reply.
 - **Adaptive Concurrency Control:** Built-in message deduplication and caching mechanisms, with an asynchronous message queue ensuring Discord messages are processed in the order they were sent.
 - **Automatic Log Rotation & Cleanup:** Logs older than 7 days are automatically cleaned up, and log files are rotated daily to maintain system efficiency.
 
@@ -128,7 +137,7 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
     - **`type`**: `official` (SDK) or `custom` (For custom providers. Must support the Gemini native format).
     - **`base_url`**: API endpoint for custom providers (required for `custom` type).
-    - **`rpm`**: Requests Per Minute limit. The bot will automatically handle rate limiting based on this value.
+    - **`rpm`**: Requests Per Minute limit (Per Key). The bot enforces rate limiting independently for each key, so multiple keys do not interfere with each other's quota.
 
     
 - **Run the Bot**
