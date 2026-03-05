@@ -119,8 +119,21 @@ class OfficialProvider(BaseProvider):
         
         max_retries = min(3, len(available_keys))
         tried_keys = set()
+        pending_futures = []  # Futures from timed-out attempts (kept alive via shield)
+        call_timeout = 20 if image_data else 10
         
         for attempt in range(max_retries):
+            # Check if any previous timed-out attempt has completed successfully
+            for fut in pending_futures:
+                if fut.done():
+                    try:
+                        response = fut.result()
+                        if response and hasattr(response, 'text') and response.text:
+                            self.logger.info(f"Recovered delayed response from previous attempt for model {model_name}")
+                            return response.text
+                    except Exception:
+                        pass
+            
             remaining = [k for k in available_keys if k not in tried_keys]
             if not remaining:
                 break
@@ -164,7 +177,7 @@ class OfficialProvider(BaseProvider):
                         safety_settings=self.safety_settings
                     )
 
-                # Execute in executor with 10s timeout per API call
+                # Execute in executor with shield to keep future alive after timeout
                 partial_func = functools.partial(
                     client.models.generate_content,
                     model=f"models/{model_name}",
@@ -172,14 +185,16 @@ class OfficialProvider(BaseProvider):
                     config=config
                 )
                 loop = asyncio.get_running_loop()
+                executor_future = loop.run_in_executor(None, partial_func)
                 try:
                     response = await asyncio.wait_for(
-                        loop.run_in_executor(None, partial_func),
-                        timeout=10
+                        asyncio.shield(executor_future),
+                        timeout=call_timeout
                     )
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"API call timed out (10s) for key {key[:8]}... model {model_name}")
-                    raise Exception(f"API call timeout (10s) for model {model_name}")
+                    self.logger.warning(f"API call timed out ({call_timeout}s) for key {key[:8]}... model {model_name}")
+                    pending_futures.append(executor_future)
+                    continue
                 
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
                     self.logger.warning(f"Blocked: {response.prompt_feedback}")
@@ -215,6 +230,21 @@ class OfficialProvider(BaseProvider):
                 # Other errors - try next key
                 else:
                     continue
+        
+        # Final chance: wait for any pending timed-out futures (up to 5s)
+        if pending_futures:
+            self.logger.info(f"Waiting up to 5s for {len(pending_futures)} pending API call(s)...")
+            done, _ = await asyncio.wait(pending_futures, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    response = fut.result()
+                    if response and hasattr(response, 'text') and response.text:
+                        if response.prompt_feedback and response.prompt_feedback.block_reason:
+                            continue
+                        self.logger.info(f"Recovered delayed response for model {model_name}")
+                        return response.text
+                except Exception:
+                    pass
         
         raise Exception(f"All attempted keys failed for provider {self.name}")
 
@@ -275,8 +305,10 @@ class CustomProvider(BaseProvider):
                     }
                 }
                 
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Dynamic timeout: 10s for text, 20s for image
+                call_timeout = 20 if image_data else 10
+                req_timeout = aiohttp.ClientTimeout(total=call_timeout)
+                async with aiohttp.ClientSession(timeout=req_timeout) as session:
                     async with session.post(url, json=payload) as resp:
                         if resp.status == 200:
                             data = await resp.json()
@@ -308,6 +340,9 @@ class CustomProvider(BaseProvider):
 
             except ModelCooldownError:
                 raise  # Re-raise cooldown errors
+            except asyncio.TimeoutError:
+                self.logger.warning(f"API call timed out ({call_timeout}s) for key {key[:8]}... model {model_name}")
+                continue
             except Exception as e:
                 self.logger.warning(f"Key {key[:8]}... failed ({attempt + 1}/{max_retries}): {str(e)}")
                 continue
