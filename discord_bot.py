@@ -488,7 +488,9 @@ class TranslatorBot(commands.Bot):
             message_key = f"{message.channel.id}:{message.id}"
             self._message_cache[message_key] = time.time()
             
-            # Process translations with timeout protection (90 seconds)
+            # Fallback timeout protection (600s) to guard against deadlocks.
+            # Actual translation timeouts are managed independently inside translate_text (60s)
+            # and translate_image (90s). Discord send operations are intentionally excluded from timing.
             async def _do_translation():
                 _processed = False
                 referenced_message = await self.fetch_referenced_message(message)
@@ -500,9 +502,9 @@ class TranslatorBot(commands.Bot):
                 return _processed
             
             try:
-                message_processed = await asyncio.wait_for(_do_translation(), timeout=90)
+                message_processed = await asyncio.wait_for(_do_translation(), timeout=600)
             except asyncio.TimeoutError:
-                self.logger.error(f"Message {message.id} processing timed out (90s)")
+                self.logger.error(f"Message {message.id} processing timed out (600s global fallback, possible deadlock)")
                 await self.send_error_message(f"消息处理超时 (Message ID: {message.id})")
                 if is_dm:
                     try:
@@ -855,6 +857,29 @@ class TranslatorBot(commands.Bot):
                             messages.append({"content": cleaned_translated})
 
             # Split long messages
+            def _split_long_line(line, limit):
+                """Split a single long line by sentence boundaries, hard truncate as fallback"""
+                sentence_separators = ['。', '！', '？', '. ', '! ', '? ', '\n']
+                parts = []
+                while len(line) > limit:
+                    # Find the last sentence boundary within limit
+                    best_split = -1
+                    for sep in sentence_separators:
+                        idx = line.rfind(sep, 0, limit)
+                        if idx > best_split:
+                            best_split = idx + len(sep)
+                    
+                    if best_split <= 0:
+                        # No suitable boundary found, hard truncate
+                        best_split = limit
+                    
+                    parts.append(line[:best_split])
+                    line = line[best_split:]
+                
+                if line:
+                    parts.append(line)
+                return parts
+
             def split_message(content, limit=2000):
                 if len(content) <= limit:
                     return [content]
@@ -866,8 +891,16 @@ class TranslatorBot(commands.Bot):
                 lines = content.split('\n')
                 
                 for line in lines:
+                    # If single line itself exceeds limit, split it further
+                    if len(line) > limit:
+                        if current_part:
+                            parts.append(current_part)
+                            current_part = ""
+                        sub_parts = _split_long_line(line, limit)
+                        parts.extend(sub_parts[:-1])
+                        current_part = sub_parts[-1]
                     # If adding new line exceeds limit
-                    if len(current_part) + len(line) + 1 > limit:
+                    elif len(current_part) + len(line) + 1 > limit:
                         if current_part:
                             parts.append(current_part)
                         current_part = line
@@ -901,14 +934,17 @@ class TranslatorBot(commands.Bot):
                     cleaned_notes = cleaned_notes[7:]  # Remove "Notes: " prefix
                 # Send notes title first
                 await channel.send(content=titles["notes"])
-                # Then send notes content (without Notes: prefix)
-                sent_message = await channel.send(f"*{cleaned_notes}*")
-                self.logger.info(f"Sent notes to channel {channel_name}: {cleaned_notes}")
+                # Then send notes content (with split protection)
+                notes_content = f"*{cleaned_notes}*"
+                notes_parts = split_message(notes_content)
+                for notes_part in notes_parts:
+                    sent_message = await channel.send(content=notes_part)
+                self.logger.info(f"Sent notes to channel {channel_name}: {cleaned_notes[:100]}")
 
         except discord.errors.HTTPException as e:
             if e.code == 50035:  # Message length error
-                self.logger.error(f"Message too long, attempting to split and resend")
-                raise  # Still raise exception to trigger error handling
+                self.logger.error(f"Message too long (2000 char limit exceeded), split_message failed to handle content")
+                raise
             else:
                 self.logger.error(f"Discord HTTPException: {str(e)}")
                 raise

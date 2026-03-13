@@ -1,4 +1,5 @@
 import logging
+import re
 import io
 import aiohttp
 import json
@@ -570,8 +571,15 @@ class Translator:
                 )
                 raise Exception(f"Translation prompt formatting error: {ke}")
             
-            # Use Manager to execute
-            result_text = await self.manager.generate_with_fallback(prompt)
+            # Use Manager to execute (60s independent timeout for entire text translation task including all retries)
+            try:
+                result_text = await asyncio.wait_for(
+                    self.manager.generate_with_fallback(prompt),
+                    timeout=60
+                )
+            except asyncio.TimeoutError:
+                self.logger.error("Text translation timed out (60s, including all retries)")
+                raise Exception("Text translation timed out (60s)")
             
             if result_text:
                  # Parse the result
@@ -608,8 +616,15 @@ class Translator:
                 image.save(buffer, format='JPEG', quality=95)
                 image_bytes = buffer.getvalue()
                 
-                # 3. Use Manager to execute
-                result_text = await self.manager.generate_with_fallback(prompt, image_data=image_bytes)
+                # 3. Use Manager to execute (90s independent timeout for entire image translation task including all retries)
+                try:
+                    result_text = await asyncio.wait_for(
+                        self.manager.generate_with_fallback(prompt, image_data=image_bytes),
+                        timeout=90
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.error("Image translation timed out (90s, including all retries)")
+                    raise Exception("Image translation timed out (90s)")
                 
                 if result_text:
                     return self._parse_translation_response(result_text, is_image=True)
@@ -669,43 +684,49 @@ class Translator:
             current_content = []
             
             # Process response text
-            for line in (l.strip() for l in text.split('\n') if l.strip()):
+            for line in text.split('\n'):
+                stripped = line.strip()
                 # Process paragraph marker
-                if line.startswith("Original text:"):
+                if stripped.startswith("Original text:"):
                     self._append_content(current_content, current_section, section_content)
                     current_section = "original"
-                    content = line.replace("Original text:", "").strip()
+                    content = stripped.replace("Original text:", "").strip()
                     if content:
                         section_content["original"].append(content)
                     current_content = []
-                elif line.startswith("Translation:"):
+                elif stripped.startswith("Translation:"):
                     self._append_content(current_content, current_section, section_content)
                     current_section = "translation"
-                    content = line.replace("Translation:", "").strip()
+                    content = stripped.replace("Translation:", "").strip()
                     if content:
                         section_content["translation"].append(content)
                     current_content = []
-                elif line.startswith("Notes:"):
+                elif stripped.startswith("Notes:"):
                     self._append_content(current_content, current_section, section_content)
                     current_section = "notes"
-                    content = line.replace("Notes:", "").strip()
+                    content = stripped.replace("Notes:", "").strip()
                     if content:
                         section_content["notes"].append(content)
                     current_content = []
+                # Preserve blank lines as paragraph separators within a section
+                elif not stripped and current_section:
+                    current_content.append("")
                 # Process regular content line
                 elif current_section:
-                    current_content.append(line)
+                    current_content.append(stripped)
             
             # Process last section content
             self._append_content(current_content, current_section, section_content)
             
-            # Merge results and clean empty lines
+            # Merge results, preserving paragraph breaks
             for key in ["original", "translation"]:
                 if section_content[key]:
-                    result[key] = '\n'.join(
-                        line for line in section_content[key] 
-                        if line.strip()
-                    )
+                    # Join all lines, then collapse multiple consecutive blank lines into one
+                    raw = '\n'.join(section_content[key])
+                    # Collapse 3+ consecutive newlines into double newline (paragraph break)
+                    cleaned = re.sub(r'\n{3,}', '\n\n', raw)
+                    # Strip leading/trailing whitespace
+                    result[key] = cleaned.strip()
                 else:
                     result[key] = ""
             

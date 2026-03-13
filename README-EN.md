@@ -14,22 +14,6 @@
 
 Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can translate text, images, and embed messages in real-time within specified channels.<br>Adapted to Discord's features, it segments and returns the original text, translation, and annotations for easy copy-pasting.
 
-## 📅**Update Log**
-
-### **2025-03-05: Fallback Mechanism Refactor**
-- **Intelligent Error Classification:** HTTP status codes now determine fallback behavior: 503 (model overloaded) immediately skips the model and enters a 5-minute cooldown; 429 (quota exhausted) retries with a randomly selected key; 400/403 (invalid key) automatically disables the key and sends a webhook alert to the admin.
-- **Per-Key RPM Limiting:** RPM limits are now enforced per individual key, so multiple keys operate at full capacity independently without interfering with each other.
-- **Random Key Selection:** Replaced fixed round-robin polling with random key selection to avoid hotspots.
-- **Two-Layer Timeout Protection:** Each API call has a 10-second timeout (for fast key/model switching), this process will reuse the 200 OK response after timeout and check if the previous key's request has completed; if the previous key's request has already returned 200 OK, it will use it directly. If all 3 keys time out, there is still a 5-second final waiting opportunity. Each message has an overall 90-second processing timeout (to prevent queue blocking). On timeout, an error webhook is sent, and DM users receive a "Service busy, please try again later" reply.
-- **Key Attempt Logging:** Each key switch is logged in detail (attempt X/3), improving observability.
-
-### **2024-12-08: Multi-Provider Support**
-- **Multi-Provider Architecture:** Added `providers.json` configuration to support both official Google Gemini API and custom third-party APIs simultaneously.
-- **Config Migration:** Deprecated `GEMINI_API_KEYS` in `.env`. All API keys are now managed centrally in `providers.json`.
-- **Custom Providers:** Support for any Gemini-compatible third-party provider via raw HTTP requests.
-- **Smart Fallback:** Configure multiple providers with priority. If the primary provider (e.g., Official) fails or hits rate limits, the bot automatically switches to the backup provider and sends a webhook notification.
-- **Granular Control:** Configure RPM (Requests Per Minute) limits individually for different models and providers.
-
 ## 💡**Key Features**
 
 ### **1. Slash Commands**
@@ -49,9 +33,37 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 - **Three-Layer Fallback:** Key failure → Retry with random key (up to 3 attempts) → Model Cooldown → Switch to backup model → Provider Fallback to next provider.
 - **Intelligent Error Classification:** 503 triggers a 5-minute model cooldown; 429 retries with a different key; 400/403 disables the key and sends a webhook alert with key details.
 - **Per-Key RPM Limiting:** RPM limits are enforced per individual key, so multiple keys run at full capacity independently.
-- **Two-Layer Timeout Protection:** 10-second per-call timeout for fast failover; 90-second per-message timeout to prevent queue blocking. Admins are notified on timeout, and DM users receive a busy reply.
+- **Granular Task-Level Timeouts:** Implemented an atomic timing strategy. Text translation (60s) and image translation (90s) are timed independently. Timing only covers the API interaction stage; asynchronous I/O like Discord message sending does not consume the translation quota, resolving conflicts where successful translations were terminated during delivery.
+- **Global 600s Fallback Protection:** A generous global timeout (10 mins) is used solely for deadlock recovery, significantly enhancing system robustness under heavy translation loads.
 - **Adaptive Concurrency Control:** Built-in message deduplication and caching mechanisms, with an asynchronous message queue ensuring Discord messages are processed in the order they were sent.
 - **Automatic Log Rotation & Cleanup:** Logs older than 7 days are automatically cleaned up, and log files are rotated daily to maintain system efficiency.
+
+## 📅**Update Log**
+
+### **2026-03-13: Prompt Instruction Refinement & Layout Logic Optimization**
+- **In-depth Prompt Audit & Fixes:** Conducted a comprehensive review of `TRANSLATION_PROMPT` and `IMAGE_TRANSLATION_PROMPT`. Fixed instructional contradictions between "preserving original paragraph structure" and "line break handling," and resolved logical conflicts in the Notes section regarding "adding explanatory notes" versus "invoking glossary terms."
+- **Redundant Instruction Cleanup:** Merged multiple repetitive rules concerning accuracy, readability, and Glossary mappings. Streamlined early-stage roleplay descriptions, reducing Token consumption while enhancing model adherence to instructions without sacrificing translation quality.
+- **Image Context Verification:** Optimized source context identification instructions for image translation, enabling the model to more accurately match the tone and context of social media screenshots, articles, or chat logs.
+
+### **2026-03-13: Independent Translation Task Timeouts & Stability Enhancement**
+- **Task-Level Independent Timeouts:** Completely refactored the translation task timing logic by decoupling the timeouts for text translation (60s) and image translation (90s) within a single Discord message. Even if one message contains multiple text/image links (e.g., FxTwitter), each sub-task is timed independently, preventing unexpected interruptions caused by cumulative API latency.
+- **Optimized Timing Metric:** Refined the endpoint for timeout calculations. Timing now only covers the duration until the model successfully returns a response (translation content or 200 OK). Expensive Discord message sending I/O is no longer counted against the translation timeout budget.
+- **Global Deadlock Fuse:** Relaxed the global `handle_message` timeout to 10 minutes (600s). This limit now serves only as a last-resort safety mechanism against code loops or deadlocks, and normal translation workflows are no longer constrained by it.
+- **Message Splitting Optimization:** Enhanced the message splitting logic for long text and notes to ensure smoother delivery to Discord when dealing with large model responses.
+
+### **2025-03-05: Fallback Mechanism Refactor**
+- **Intelligent Error Classification:** HTTP status codes now determine fallback behavior: 503 (model overloaded) immediately skips the model and enters a 5-minute cooldown; 429 (quota exhausted) retries with a randomly selected key; 400/403 (invalid key) automatically disables the key and sends a webhook alert to the admin.
+- **Per-Key RPM Limiting:** RPM limits are now enforced per individual key, so multiple keys operate at full capacity independently without interfering with each other.
+- **Random Key Selection:** Replaced fixed round-robin polling with random key selection to avoid hotspots.
+- **Two-Layer Timeout Protection:** Each API call has a 10-20 second timeout (for fast key/model switching). This process reuses the 200 OK response even if it arrives after the timeout and checks if previous requests completed. If all 3 keys time out, there is still a 5-second final waiting opportunity. The overall processing per message had a 90s soft limit (now optimized into independent sub-task timers in the 2026-03-13 update).
+- **Key Attempt Logging:** Each key switch is logged in detail (attempt X/3), improving observability.
+
+### **2024-12-08: Multi-Provider Support**
+- **Multi-Provider Architecture:** Added `providers.json` configuration to support both official Google Gemini API and custom third-party APIs simultaneously.
+- **Config Migration:** Deprecated `GEMINI_API_KEYS` in `.env`. All API keys are now managed centrally in `providers.json`.
+- **Custom Providers:** Support for any Gemini-compatible third-party provider via raw HTTP requests.
+- **Smart Fallback:** Configure multiple providers with priority. If the primary provider (e.g., Official) fails or hits rate limits, the bot automatically switches to the backup provider and sends a webhook notification.
+- **Granular Control:** Configure RPM (Requests Per Minute) limits individually for different models and providers.
 
 ## ⚙**Installation & Configuration**
 
