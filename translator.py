@@ -282,7 +282,12 @@ class CustomProvider(BaseProvider):
             try:
                 await self._check_rate_limit(model_name, key)
                 
+                # T1: Dual key delivery - URL param + Header (maximum compatibility)
                 url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": key
+                }
                 
                 # Construct payload
                 parts = [{"text": prompt}]
@@ -310,16 +315,58 @@ class CustomProvider(BaseProvider):
                 call_timeout = 20 if image_data else 10
                 req_timeout = aiohttp.ClientTimeout(total=call_timeout)
                 async with aiohttp.ClientSession(timeout=req_timeout) as session:
-                    async with session.post(url, json=payload) as resp:
+                    # T5: Disable auto-redirect to detect misconfigured proxies
+                    async with session.post(url, json=payload, headers=headers, allow_redirects=False) as resp:
+                        # T5: Redirect detection
+                        if resp.status in (301, 302, 303, 307, 308):
+                            redirect_target = resp.headers.get("Location", "unknown")
+                            raise Exception(
+                                f"Provider {self.name} redirected to {redirect_target}. "
+                                f"Check base_url configuration: {self.base_url}"
+                            )
+                        
                         if resp.status == 200:
-                            data = await resp.json()
+                            # T2: Detect text/html responses (Cloudflare JS challenge, wrong endpoint, etc.)
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "text/html" in content_type:
+                                html_body = await resp.text()
+                                title_match = re.search(r"<title>(.*?)</title>", html_body, re.IGNORECASE | re.DOTALL)
+                                title = title_match.group(1).strip() if title_match else "Unknown"
+                                raise Exception(
+                                    f"Provider {self.name} returned HTML instead of JSON "
+                                    f"(title: '{title}'). "
+                                    f"Please verify base_url supports Gemini API format. "
+                                    f"Current base_url: {self.base_url}"
+                                )
+                            
+                            # T4: Force JSON parsing regardless of Content-Type header
+                            data = await resp.json(content_type=None)
+                            
+                            # T3: Detect API-level error wrapped in 200 response
+                            if "error" in data:
+                                error_info = data["error"]
+                                error_msg = error_info.get("message", str(error_info)) if isinstance(error_info, dict) else str(error_info)
+                                raise Exception(
+                                    f"Provider {self.name} returned error in 200 response: {error_msg}"
+                                )
+                            
+                            # T3: Validate response structure instead of silent return ""
                             try:
-                                return data['candidates'][0]['content']['parts'][0]['text']
-                            except (KeyError, IndexError):
-                                return ""
+                                text = data['candidates'][0]['content']['parts'][0]['text']
+                                return text
+                            except (KeyError, IndexError) as e:
+                                self.logger.error(
+                                    f"Unexpected response structure from {self.name}: "
+                                    f"{json.dumps(data, ensure_ascii=False)[:500]}"
+                                )
+                                raise Exception(
+                                    f"Invalid response structure from {self.name}: missing candidates ({str(e)})"
+                                )
                         
                         # Handle error responses by status code
                         error_text = await resp.text()
+                        # T9: Sanitize API key in error text before logging
+                        error_text_safe = error_text.replace(key, f"{key[:8]}...***")
                         
                         if resp.status == 503:
                             self.model_cooldowns[model_name] = time.time() + 300
@@ -328,16 +375,16 @@ class CustomProvider(BaseProvider):
                         
                         elif resp.status == 429:
                             self.logger.warning(f"Key {key[:8]}... rate limited (429)")
-                            raise Exception(f"HTTP 429: {error_text[:200]}")
+                            raise Exception(f"HTTP 429: {error_text_safe[:200]}")
                         
                         elif resp.status in (400, 403):
                             self.disabled_keys.add(key)
                             self.logger.error(f"Key {key[:8]}... marked as disabled (HTTP {resp.status})")
-                            asyncio.create_task(self._send_key_error_webhook(key, f"HTTP {resp.status}: {error_text[:300]}"))
-                            raise Exception(f"HTTP {resp.status}: {error_text[:200]}")
+                            asyncio.create_task(self._send_key_error_webhook(key, f"HTTP {resp.status}: {error_text_safe[:300]}"))
+                            raise Exception(f"HTTP {resp.status}: {error_text_safe[:200]}")
                         
                         else:
-                            raise Exception(f"HTTP {resp.status}: {error_text[:200]}")
+                            raise Exception(f"HTTP {resp.status}: {error_text_safe[:200]}")
 
             except ModelCooldownError:
                 raise  # Re-raise cooldown errors
@@ -349,6 +396,87 @@ class CustomProvider(BaseProvider):
                 continue
                 
         raise Exception(f"All attempted keys failed for provider {self.name}")
+
+    async def health_check(self) -> dict:
+        """T8: Startup health check - verify provider connectivity with minimal request"""
+        result = {"provider": self.name, "base_url": self.base_url, "status": "unknown"}
+        
+        if not self.api_keys:
+            result["status"] = "error"
+            result["detail"] = "No API keys configured"
+            self.logger.error(f"❌ Provider '{self.name}' health check failed: no API keys")
+            return result
+        
+        key = self.api_keys[0]
+        model_name = self.models_config[0]["name"] if self.models_config else "gemini-2.0-flash"
+        url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+        }
+        payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+        
+        try:
+            req_timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=req_timeout) as session:
+                async with session.post(url, json=payload, headers=headers, allow_redirects=False) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+                    
+                    if resp.status in (301, 302, 303, 307, 308):
+                        redirect_target = resp.headers.get("Location", "unknown")
+                        result["status"] = "error"
+                        result["detail"] = f"Redirected to {redirect_target}"
+                        self.logger.error(
+                            f"❌ Provider '{self.name}' health check failed: "
+                            f"redirected to {redirect_target}. Check base_url: {self.base_url}"
+                        )
+                    elif "text/html" in content_type:
+                        html_body = await resp.text()
+                        title_match = re.search(r"<title>(.*?)</title>", html_body, re.IGNORECASE | re.DOTALL)
+                        title = title_match.group(1).strip() if title_match else "Unknown"
+                        result["status"] = "error"
+                        result["detail"] = f"Returned HTML (title: '{title}')"
+                        self.logger.error(
+                            f"⚠️ Provider '{self.name}' returned HTML instead of JSON "
+                            f"(title: '{title}'). Check base_url: {self.base_url}"
+                        )
+                    elif resp.status == 200:
+                        try:
+                            data = await resp.json(content_type=None)
+                            if "error" in data:
+                                error_msg = data["error"].get("message", str(data["error"])) if isinstance(data["error"], dict) else str(data["error"])
+                                result["status"] = "warning"
+                                result["detail"] = f"API error: {error_msg}"
+                                self.logger.warning(f"⚠️ Provider '{self.name}' returned API error: {error_msg}")
+                            elif "candidates" in data:
+                                result["status"] = "ok"
+                                result["detail"] = "Connected successfully"
+                                self.logger.info(f"✅ Provider '{self.name}' health check passed")
+                            else:
+                                result["status"] = "warning"
+                                result["detail"] = "200 OK but unexpected JSON structure"
+                                self.logger.warning(f"⚠️ Provider '{self.name}' returned unexpected JSON structure")
+                        except Exception as parse_err:
+                            result["status"] = "warning"
+                            result["detail"] = f"JSON parse error: {str(parse_err)}"
+                            self.logger.warning(f"⚠️ Provider '{self.name}' returned non-JSON 200 response")
+                    else:
+                        body_preview = (await resp.text())[:200]
+                        result["status"] = "warning"
+                        result["detail"] = f"HTTP {resp.status}: {body_preview}"
+                        self.logger.warning(
+                            f"⚠️ Provider '{self.name}' returned HTTP {resp.status}: {body_preview}"
+                        )
+        except asyncio.TimeoutError:
+            result["status"] = "error"
+            result["detail"] = "Connection timed out (15s)"
+            self.logger.error(f"❌ Provider '{self.name}' health check timed out (15s)")
+        except Exception as e:
+            result["status"] = "error"
+            result["detail"] = f"Connection error: {str(e)}"
+            self.logger.error(f"❌ Provider '{self.name}' health check failed: {str(e)}")
+        
+        return result
 
 class ProviderManager:
     def __init__(self, providers_config: Dict, safety_settings: List):
@@ -374,6 +502,29 @@ class ProviderManager:
         if not self.provider_order and self.providers:
             # If no order specified but providers exist, add them arbitrarily
             self.provider_order = list(self.providers.keys())
+
+    async def run_health_checks(self):
+        """T8: Run health checks for all custom providers at startup"""
+        self.logger.info("Running provider health checks...")
+        results = []
+        for p_name, provider in self.providers.items():
+            if isinstance(provider, CustomProvider):
+                result = await provider.health_check()
+                results.append(result)
+        
+        ok_count = sum(1 for r in results if r["status"] == "ok")
+        warn_count = sum(1 for r in results if r["status"] == "warning")
+        err_count = sum(1 for r in results if r["status"] == "error")
+        
+        if results:
+            self.logger.info(
+                f"Health check complete: {ok_count} OK, {warn_count} warning(s), {err_count} error(s) "
+                f"out of {len(results)} custom provider(s)"
+            )
+        else:
+            self.logger.info("No custom providers to health check")
+        
+        return results
 
     async def generate_with_fallback(self, prompt: str, image_data: bytes = None) -> str:
         """Try all providers in order, with model and provider fallback"""

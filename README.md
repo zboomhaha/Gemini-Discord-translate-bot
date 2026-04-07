@@ -32,10 +32,10 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 - **三层 Fallback 机制：** Key 失败 → 随机换 Key（最多 3 次）→ Model Cooldown 切换备用 Model → Provider Fallback 切换备用服务商。
 - **智能错误分级：** 503 立即触发 5 分钟 Model Cooldown；429 随机换 Key 重试；400/403 自动禁用 Key 并发送 Webhook 告警（附带 Key 信息）。
 - **Per-Key RPM 限速：** RPM 配置作用于单个 Key，多 Key 并行时速率互不干扰。
-- **任务级精细化超时：** 采用原子化计时策略。文字翻译 (60s) 与图片翻译 (90s) 独立计时，且计时仅覆盖 API 交互阶段。Discord 消息发送等异步 I/O 不占用翻译时间配额，彻底解决"翻译成功但在发送时触发超时"的逻辑冲突。
-- **全局 600s 兜底保护：** 宽裕的全局超时限制（10分钟）仅用于死锁自愈，极大增强了极重度翻译负载下的系统鲁棒性。
-- **自适应并发控制：** 内置消息去重与缓存机制，异步消息队列可确保频道内的Discord消息按发送顺序处理。
-- **自动轮转和清理日志：** 日志文件每日自动轮转，自动清理超过7天的日志记录。
+- **任务级精细化超时：** 采用原子化计时策略。文字翻译 (60s) 与图片翻译 (90s) 独立计时，且计时仅覆盖 API 交互阶段。Discord 消息发送等异步 I/O 不占用翻译时间配额。
+- **全局 600s 兜底保护：** 宽裕的全局超时限制（10分钟）仅用于死锁自愈。
+- **自适应并发控制：** 内置消息去重与缓存机制，异步消息队列确保消息顺序。
+- **自动轮转和清理日志：** 日志文件每日自动轮转，自动清理超过7天的记录。
 
 ### **4. Default Language=zh-CN的彩蛋**
 
@@ -43,6 +43,13 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
 - **智能跳过中文行：** 如果单行中的中文占比超过50%，则该行不会被提交至Gemini进行翻译。
 
 ## 📅**更新日志**
+
+### **2026-04-08: 自定义 Provider 鲁棒性重构与错误收集系统**
+- **接口兼容性跃迁 (Dual-Auth)：** 实现了 API Key 的“双投递”鉴权（同时发送 URL 参数和 `x-goog-api-key` Header），解决了部分中转服务商因未透传 URL 参数导致的 `401 Unauthorized` 问题。
+- **全方位响应验证 (Response Guardian)：** 引入了对 `text/html` 响应的严格检测。当 API 返回 Cloudflare 验证页面或错误路径导致的 HTML 时，机器人会提取 HTML 标题并抛出明确错误，不再发生“静默失败”返回空内容。
+- **重定向与内部错误拦截：** 增加了对 3xx 重定向的显式检测，并针对部分 API 在 HTTP 200 下返回包含 `error` 字段的 JSON 结构进行了防护处理。
+- **错误收集系统：** 彻底重构了翻译子任务的管理逻辑。对于同一条消息中的多个翻译请求（文本、Embed、FxTwitter、多附件图片），机器人现在会并行/串行执行并收集所有异常。哪怕其中一张图片由于 OCR 失败，其他部分的翻译仍会继续，且仅在所有部分均失败时才发送综合 Webhook 告警，显著降低了报错噪音。
+- **启动连通性自检 (Startup Health Check)：** 机器人启动时新增对所有自定义 Provider 的连通性测试。若发现由于 Base URL 配置不当（如使用了 OpenAI 格式而非 Gemini 格式）导致的失败，将在日志中给出明确提醒。
 
 ### **2026-03-13: Prompt 指令精细化与排版逻辑优化**
 - **Prompt 深度审计与修复：** 对 `TRANSLATION_PROMPT` 和 `IMAGE_TRANSLATION_PROMPT` 进行了全面审查。修复了关于“保留原始段落结构”与“处理断行”之间的指令矛盾，并消除了 Notes 区域中“添加注释”与“禁止解释词汇”的逻辑冲突。
@@ -156,6 +163,12 @@ Walmart Papago 是一款自部署的、Gemini驱动的Discord翻译机器人，�
     - **`type`**: `official` (官方SDK) 或 `custom` (第三方接口，必须支持Gemini原生格式)。
     - **`base_url`**: 自定义服务商的 API 地址（仅 `custom` 类型需要）。
     - **`rpm`**: 每分钟请求数限制（Per Key），机器人会根据此值对每个 Key 独立进行速率控制，多 Key 之间速率互不干扰。
+
+    > ⚠️ **关于自定义 Provider 的重要提示：**
+    > - `base_url` 必须指向支持 **Gemini 原生 API 格式**（`v1beta/models/{model}:generateContent`）的端点。
+    > - **不支持** OpenAI 兼容格式（`/v1/chat/completions`）的端点。
+    > - 部分中转站需要使用特定的路径后缀（如 `/gemini`）来区分 Gemini 格式端点，请参考中转站的使用文档确认正确的 Base URL。
+    > - 示例：如果中转站地址是 `https://example.com/gemini`，则 `base_url` 应填写 `https://example.com/gemini`（结尾不可有斜杠）。
 
     
 - **运行bot**

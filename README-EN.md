@@ -33,12 +33,19 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 - **Three-Layer Fallback:** Key failure → Retry with random key (up to 3 attempts) → Model Cooldown → Switch to backup model → Provider Fallback to next provider.
 - **Intelligent Error Classification:** 503 triggers a 5-minute model cooldown; 429 retries with a different key; 400/403 disables the key and sends a webhook alert with key details.
 - **Per-Key RPM Limiting:** RPM limits are enforced per individual key, so multiple keys run at full capacity independently.
-- **Granular Task-Level Timeouts:** Implemented an atomic timing strategy. Text translation (60s) and image translation (90s) are timed independently. Timing only covers the API interaction stage; asynchronous I/O like Discord message sending does not consume the translation quota, resolving conflicts where successful translations were terminated during delivery.
-- **Global 600s Fallback Protection:** A generous global timeout (10 mins) is used solely for deadlock recovery, significantly enhancing system robustness under heavy translation loads.
+- **Granular Task-Level Timeouts:** Implemented an atomic timing strategy. Text translation (60s) and image translation (90s) are timed independently. Timing only covers the API interaction stage; asynchronous I/O like Discord message sending does not consume the translation quota.
+- **Global 600s Fallback Protection:** A generous global timeout (10 mins) is used solely for deadlock recovery.
 - **Adaptive Concurrency Control:** Built-in message deduplication and caching mechanisms, with an asynchronous message queue ensuring Discord messages are processed in the order they were sent.
 - **Automatic Log Rotation & Cleanup:** Logs older than 7 days are automatically cleaned up, and log files are rotated daily to maintain system efficiency.
 
 ## 📅**Update Log**
+
+### **2026-04-08: Custom Provider Robustness Refactor & Error Collection System**
+- **Authentication Compatibility (Dual-Auth):** Implemented "dual-delivery" authentication (sending the API key in both URL parameters and `x-goog-api-key` headers) to resolve `401 Unauthorized` issues caused by proxy servers that do not forward URL parameters.
+- **Strict Response Validation (Response Guardian):** Introduced strict detection for `text/html` responses. When an API returns a Cloudflare verification page or an HTML error, the bot extracts the HTML title and raises a clear error instead of failing silently with empty content.
+- **Redirect & Internal Error Interception:** Added explicit detection for 3xx redirects and protection against APIs that return HTTP 200 with JSON structures containing `error` fields.
+- **Error Collection System:** Refactored the management of translation sub-tasks. For multiple requests within a single message (Text, Embed, FxTwitter, multiple attachments), the bot now collects all exceptions. If one part fails (e.g., OCR error), translation of other parts continues. A comprehensive Webhook alert is sent only if all sub-tasks fail, reducing alert noise.
+- **Startup Connection Self-Test (Health Check):** Added a connectivity test for all custom providers during startup. If failures occur due to improper Base URL configuration (e.g., using OpenAI format instead of Gemini format), clear warnings are provided in the logs.
 
 ### **2026-03-13: Prompt Instruction Refinement & Layout Logic Optimization**
 - **In-depth Prompt Audit & Fixes:** Conducted a comprehensive review of `TRANSLATION_PROMPT` and `IMAGE_TRANSLATION_PROMPT`. Fixed instructional contradictions between "preserving original paragraph structure" and "line break handling," and resolved logical conflicts in the Notes section regarding "adding explanatory notes" versus "invoking glossary terms."
@@ -150,6 +157,12 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
     - **`type`**: `official` (SDK) or `custom` (For custom providers. Must support the Gemini native format).
     - **`base_url`**: API endpoint for custom providers (required for `custom` type).
     - **`rpm`**: Requests Per Minute limit (Per Key). The bot enforces rate limiting independently for each key, so multiple keys do not interfere with each other's quota.
+
+    > ⚠️ **Important Notes for Custom Providers:**
+    > - `base_url` must point to an endpoint that supports the **Gemini native API format** (`v1beta/models/{model}:generateContent`).
+    > - OpenAI-compatible endpoints (`/v1/chat/completions`) are **not supported**.
+    > - Some third-party providers require a specific path suffix (e.g., `/gemini`) to access the Gemini API endpoint. Please refer to your provider's documentation to confirm the correct Base URL.
+    > - Example: If the provider's address is `https://example.com/gemini`, set `base_url` to `https://example.com/gemini` (no trailing slash).
 
     
 - **Run the Bot**

@@ -163,6 +163,12 @@ class TranslatorBot(commands.Bot):
             # Initialize Discord Bot's independent session
             self.session = aiohttp.ClientSession()
 
+            # T10: Run provider health checks at startup
+            try:
+                await self.translator.manager.run_health_checks()
+            except Exception as hc_err:
+                self.logger.warning(f"Provider health checks encountered an error (non-fatal): {hc_err}")
+
             # Start cleanup tasks
             self.cleanup_task = self.loop.create_task(self._cleanup_messages())
 
@@ -493,12 +499,35 @@ class TranslatorBot(commands.Bot):
             # and translate_image (90s). Discord send operations are intentionally excluded from timing.
             async def _do_translation():
                 _processed = False
+                _errors = []  # T11: Error collector
+                
                 referenced_message = await self.fetch_referenced_message(message)
                 if referenced_message:
-                    ref_result = await self.process_translated_content(referenced_message, target_channel)
+                    ref_result, ref_errors = await self.process_translated_content(referenced_message, target_channel)
                     _processed = _processed or ref_result
-                cur_result = await self.process_translated_content(message, target_channel)
+                    _errors.extend(ref_errors)
+                
+                cur_result, cur_errors = await self.process_translated_content(message, target_channel)
                 _processed = _processed or cur_result
+                _errors.extend(cur_errors)
+                
+                # T11: Error reporting logic
+                if _errors:
+                    if not _processed:
+                        # All sub-tasks failed — report to webhook
+                        error_summary = "; ".join(_errors[:5])  # Cap at 5 errors to avoid spam
+                        if len(_errors) > 5:
+                            error_summary += f" ... and {len(_errors) - 5} more"
+                        await self.send_error_message(
+                            f"消息 {message.id} 翻译全部失败 ({len(_errors)} 个错误):\n{error_summary}"
+                        )
+                    else:
+                        # Partial success — log warning only, don't spam webhook
+                        self.logger.warning(
+                            f"Message {message.id} partially succeeded with {len(_errors)} error(s): "
+                            + "; ".join(_errors[:3])
+                        )
+                
                 return _processed
             
             try:
@@ -538,8 +567,11 @@ class TranslatorBot(commands.Bot):
             self.logger.info(f"End processing message: {message.id}")
 
     async def process_translated_content(self, message, target_channel):
-        """Process specific message content, request translation and retrieve translation result"""
+        """Process specific message content, request translation and retrieve translation result.
+        Returns: tuple (success: bool, errors: list[str])
+        """
         success = False
+        errors = []  # T11: Error collector
 
         # Process normal text content
         if message.content:
@@ -553,40 +585,45 @@ class TranslatorBot(commands.Bot):
                 
                 try:
                     # Handle the link
-                    fxtwitter_processed = await self.handle_fxtwitter_link(url, target_channel)
+                    fxtwitter_processed, fxtwitter_errors = await self.handle_fxtwitter_link(url, target_channel)
                     success = success or fxtwitter_processed
+                    errors.extend(fxtwitter_errors)
                     
                     # If FxTwitter link was processed, skip the rest of the text content
                     if fxtwitter_processed:
                         self.logger.info("FxTwitter link processed successfully, skipping further text processing.")
-                        return success # Return the current success status
+                        return success, errors
 
                 except Exception as e:
                     self.logger.error(f"Error handling FxTwitter link {url}: {e}", exc_info=True)
-                    # If the handler fails, we should not proceed to process the rest of the message
-                    # as if it were normal text, because it might misinterpret the content.
-                    return False # Indicate failure and stop processing this message content.
+                    errors.append(f"FxTwitter link ({url}): {str(e)}")
+                    return False, errors
 
             # Priority 2: Process remaining text content after special handling
             self.logger.info(f"Processing normal text content: {message.content[:100]}...")
             processed_text = self.text_pre_check(message.content)
             if processed_text:
-                result = await self.translator.translate_text(processed_text)
-                if isinstance(result, dict):
-                    await self.send_translation_result(
-                        target_channel,
-                        result.get("original"),
-                        result.get("translation"),
-                        notes=result.get("notes")
-                    )
-                else:
-                    await self.send_translation_result(target_channel, processed_text, result)
-                success = True
+                try:
+                    result = await self.translator.translate_text(processed_text)
+                    if isinstance(result, dict):
+                        await self.send_translation_result(
+                            target_channel,
+                            result.get("original"),
+                            result.get("translation"),
+                            notes=result.get("notes")
+                        )
+                    else:
+                        await self.send_translation_result(target_channel, processed_text, result)
+                    success = True
+                except Exception as e:
+                    self.logger.error(f"Error translating text: {str(e)}", exc_info=True)
+                    errors.append(f"Text translation: {str(e)}")
 
         # Process attachments
         if message.attachments:
-            await self.handle_attachments(message.attachments, target_channel)
-            success = True
+            attach_success, attach_errors = await self.handle_attachments(message.attachments, target_channel)
+            success = success or attach_success
+            errors.extend(attach_errors)
 
         # Process embeds
         for embed in message.embeds:
@@ -610,6 +647,7 @@ class TranslatorBot(commands.Bot):
                         embed_success = True
                     except Exception as e:
                         self.logger.error(f"Error translating embed title: {str(e)}", exc_info=True)
+                        errors.append(f"Embed title: {str(e)}")
 
             if embed.description:
                 processed_desc = self.text_pre_check(embed.description)
@@ -629,6 +667,7 @@ class TranslatorBot(commands.Bot):
                         embed_success = True
                     except Exception as e:
                         self.logger.error(f"Error translating embed description: {str(e)}", exc_info=True)
+                        errors.append(f"Embed description: {str(e)}")
 
             if embed.image:
                 self.logger.info(f"Processing embed image: {embed.image.url}")
@@ -646,15 +685,19 @@ class TranslatorBot(commands.Bot):
                         embed_success = True
                 except Exception as e:
                     self.logger.error(f"Error processing embed image: {str(e)}", exc_info=True)
+                    errors.append(f"Embed image ({embed.image.url}): {str(e)}")
 
             success = success or embed_success  # If any embed processing is successful, overall processing is successful
 
-        return success  # Return processing status
+        return success, errors  # T11: Return both success flag and collected errors
 
     async def handle_fxtwitter_link(self, url, target_channel):
-        """Handle FxTwitter link by fetching JSON data from the api.fxtwitter.com endpoint."""
+        """Handle FxTwitter link by fetching JSON data from the api.fxtwitter.com endpoint.
+        Returns: tuple (success: bool, errors: list[str])
+        """
         api_url = url.replace("fxtwitter.com", "api.fxtwitter.com")
         self.logger.info(f"Requesting FxTwitter API: {api_url}")
+        errors = []  # T11: Error collector
 
         try:
             async with self.session.get(api_url) as response:
@@ -692,45 +735,57 @@ class TranslatorBot(commands.Bot):
                 if description:
                     processed_desc = self.text_pre_check(description)
                     if processed_desc:
-                        result = await self.translator.translate_text(processed_desc)
-                        if isinstance(result, dict):
-                            await self.send_translation_result(
-                                target_channel,
-                                result.get("original"),
-                                result.get("translation"),
-                                notes=result.get("notes")
-                            )
-                        else:
-                            await self.send_translation_result(target_channel, processed_desc, result)
-                        success = True
+                        try:
+                            result = await self.translator.translate_text(processed_desc)
+                            if isinstance(result, dict):
+                                await self.send_translation_result(
+                                    target_channel,
+                                    result.get("original"),
+                                    result.get("translation"),
+                                    notes=result.get("notes")
+                                )
+                            else:
+                                await self.send_translation_result(target_channel, processed_desc, result)
+                            success = True
+                        except Exception as e:
+                            self.logger.error(f"Error translating FxTwitter text: {str(e)}", exc_info=True)
+                            errors.append(f"FxTwitter text: {str(e)}")
                 
                 for image_url in image_urls:
                     self.logger.info(f"Processing image from FxTwitter: {image_url}")
-                    translated_image = await self.translator.translate_image(image_url)
-                    if translated_image:
-                        await self.send_translation_result(
-                            target_channel,
-                            translated_image.get("original"),
-                            translated_image.get("translation"),
-                            notes=translated_image.get("notes"),
-                            image_url=image_url
-                        )
-                        success = True
+                    try:
+                        translated_image = await self.translator.translate_image(image_url)
+                        if translated_image:
+                            await self.send_translation_result(
+                                target_channel,
+                                translated_image.get("original"),
+                                translated_image.get("translation"),
+                                notes=translated_image.get("notes"),
+                                image_url=image_url
+                            )
+                            success = True
+                    except Exception as e:
+                        self.logger.error(f"Error translating FxTwitter image {image_url}: {str(e)}", exc_info=True)
+                        errors.append(f"FxTwitter image ({image_url}): {str(e)}")
                 
-                return success
+                return success, errors
 
         except aiohttp.ClientError as e:
             self.logger.error(f"Network error fetching FxTwitter API {api_url}: {e}", exc_info=True)
-            return False
+            errors.append(f"FxTwitter API network error: {str(e)}")
+            return False, errors
         except json.JSONDecodeError as e:
             self.logger.error(f"Failed to parse JSON from FxTwitter API {api_url}: {e}", exc_info=True)
-            return False
+            errors.append(f"FxTwitter API JSON parse error: {str(e)}")
+            return False, errors
         except KeyError as e:
             self.logger.error(f"Key error when parsing FxTwitter JSON from {api_url}: Missing key {e}", exc_info=True)
-            return False
+            errors.append(f"FxTwitter API key error: missing {str(e)}")
+            return False, errors
         except Exception as e:
             self.logger.error(f"An unexpected error occurred while handling FxTwitter link {url}: {e}", exc_info=True)
-            return False
+            errors.append(f"FxTwitter unexpected error: {str(e)}")
+            return False, errors
 
     def text_pre_check(self, text: str) -> Optional[str]:
         """Process text content, return processed text or None"""
@@ -950,8 +1005,12 @@ class TranslatorBot(commands.Bot):
                 raise
 
     async def handle_attachments(self, attachments, target_channel):
-        """Process attachments in messages"""
+        """Process attachments in messages.
+        Returns: tuple (success: bool, errors: list[str])
+        """
         self.logger.debug(f"Attachment count: {len(attachments)}")
+        success = False
+        errors = []  # T11: Error collector
         for index, attachment in enumerate(attachments, start=1):
             self.logger.debug(f"Processing attachment {index}: {attachment.to_dict()}")
             if attachment.content_type and attachment.content_type.startswith('image/'):
@@ -968,10 +1027,13 @@ class TranslatorBot(commands.Bot):
                             image_url=attachment.url
                         )
                         self.logger.info("Attachment image translation completed")
+                        success = True
                 except Exception as e:
                     self.logger.error(f"Error translating attachment image: {str(e)}", exc_info=True)
+                    errors.append(f"Attachment image ({attachment.url}): {str(e)}")
             else:
                 self.logger.debug(f"Current attachment is not an image or missing content_type: {attachment.url}")
+        return success, errors
 
     async def fetch_referenced_message(self, message):
         """Fetch referenced message"""
