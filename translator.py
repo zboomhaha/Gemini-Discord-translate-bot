@@ -194,6 +194,7 @@ class OfficialProvider(BaseProvider):
                     )
                 except asyncio.TimeoutError:
                     self.logger.warning(f"API call timed out ({call_timeout}s) for key {key[:8]}... model {model_name}")
+                    executor_future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
                     pending_futures.append(executor_future)
                     continue
                 
