@@ -290,6 +290,8 @@ class CustomProvider(BaseProvider):
                 url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
                 headers = {
                     "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (compatible; WalmartPapago/1.0; +https://github.com/Cranberrycrisp/Walmart_Papago)",
                     "x-goog-api-key": key
                 }
                 
@@ -305,7 +307,7 @@ class CustomProvider(BaseProvider):
                     })
                 
                 payload = {
-                    "contents": [{"parts": parts}],
+                    "contents": [{"role": "user", "parts": parts}],
                     "generationConfig": {
                          "temperature": 1.0 if image_data else 1.2,
                          "topP": 0.95,
@@ -381,10 +383,16 @@ class CustomProvider(BaseProvider):
                             self.logger.warning(f"Key {key[:8]}... rate limited (429)")
                             raise Exception(f"HTTP 429: {error_text_safe[:200]}")
                         
-                        elif resp.status in (400, 403):
-                            self.disabled_keys.add(key)
-                            self.logger.error(f"Key {key[:8]}... marked as disabled (HTTP {resp.status})")
-                            asyncio.create_task(self._send_key_error_webhook(key, f"HTTP {resp.status}: {error_text_safe[:300]}"))
+                        elif resp.status in (400, 401, 403):
+                            if self._is_key_error_response(resp.status, error_text):
+                                self.disabled_keys.add(key)
+                                self.logger.error(f"Key {key[:8]}... marked as disabled (HTTP {resp.status})")
+                                asyncio.create_task(self._send_key_error_webhook(key, f"HTTP {resp.status}: {error_text_safe[:300]}"))
+                            else:
+                                self.logger.warning(
+                                    f"Provider {self.name} returned non-key HTTP {resp.status}: "
+                                    f"{error_text_safe[:200]}"
+                                )
                             raise Exception(f"HTTP {resp.status}: {error_text_safe[:200]}")
                         
                         else:
@@ -401,6 +409,25 @@ class CustomProvider(BaseProvider):
                 
         raise Exception(f"All attempted keys failed for provider {self.name}")
 
+    def _is_key_error_response(self, status: int, error_text: str) -> bool:
+        """Return True only for responses that clearly indicate an invalid API key."""
+        text = (error_text or "").lower()
+        key_error_markers = (
+            "api_key_invalid",
+            "api key not valid",
+            "api key expired",
+            "invalid api key",
+            "invalid_api_key",
+            "unauthorized",
+            "authentication",
+            "credential",
+        )
+        if status == 401:
+            return True
+        if any(marker in text for marker in key_error_markers):
+            return True
+        return status == 403 and "permission_denied" in text and "api key" in text
+
     async def health_check(self) -> dict:
         """T8: Startup health check - verify provider connectivity with minimal request"""
         result = {"provider": self.name, "base_url": self.base_url, "status": "unknown"}
@@ -416,9 +443,11 @@ class CustomProvider(BaseProvider):
         url = f"{self.base_url}/v1beta/models/{model_name}:generateContent?key={key}"
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; WalmartPapago/1.0; +https://github.com/Cranberrycrisp/Walmart_Papago)",
             "x-goog-api-key": key
         }
-        payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+        payload = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
         
         try:
             req_timeout = aiohttp.ClientTimeout(total=15)
@@ -938,5 +967,4 @@ class Translator:
         """Append current content to corresponding section"""
         if current_content and current_section:
             section_content[current_section].extend(current_content)
-
 
