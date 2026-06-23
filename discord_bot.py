@@ -80,6 +80,11 @@ class TranslatorBot(commands.Bot):
         # Initialize error handling configuration
         self.MAX_RETRY_ATTEMPTS = 3  # maximum retry attempts
         self.RETRY_DELAY = 5  # retry interval (seconds)
+        try:
+            self.PARTIAL_ERROR_WEBHOOK_COOLDOWN = int(os.getenv('PARTIAL_ERROR_WEBHOOK_COOLDOWN', '600'))
+        except ValueError:
+            self.PARTIAL_ERROR_WEBHOOK_COOLDOWN = 600
+        self._partial_error_notification_times = {}
         self._keep_running = True
 
         # Initialize translator 
@@ -527,6 +532,7 @@ class TranslatorBot(commands.Bot):
                             f"Message {message.id} partially succeeded with {len(_errors)} error(s): "
                             + "; ".join(_errors[:3])
                         )
+                        await self.maybe_send_partial_error_message(message, _errors)
                 
                 return _processed
             
@@ -565,6 +571,80 @@ class TranslatorBot(commands.Bot):
                 status = "done"
             self.logger.info(f"Message {message.id} processed {status}")
             self.logger.info(f"End processing message: {message.id}")
+
+    def get_critical_partial_errors(self, errors):
+        """Return partial-success errors that still deserve an operator notification."""
+        critical_markers = (
+            "all providers failed",
+            "http 401",
+            "http 403",
+            "permission_denied",
+            "does not have permission",
+            "no available api keys",
+            "no providers configured",
+        )
+        critical_prefixes = (
+            "fxtwitter image",
+            "attachment image",
+            "embed image",
+        )
+
+        critical_errors = []
+        for error in errors:
+            text = str(error)
+            lower_text = text.lower()
+            if lower_text.startswith(critical_prefixes) or any(marker in lower_text for marker in critical_markers):
+                critical_errors.append(text)
+
+        return critical_errors
+
+    def build_partial_error_notification_key(self, critical_errors):
+        """Build a throttling key from the error class, not the individual message URL."""
+        normalized = " ".join(str(error).lower() for error in critical_errors)
+
+        if "does not have permission" in normalized or "permission_denied" in normalized or "http 403" in normalized:
+            category = "permission"
+        elif "all providers failed" in normalized:
+            category = "all-providers-failed"
+        elif "no available api keys" in normalized or "http 401" in normalized:
+            category = "auth"
+        elif "image" in normalized:
+            category = "image"
+        else:
+            category = "critical"
+
+        return category
+
+    async def maybe_send_partial_error_message(self, message, errors):
+        critical_errors = self.get_critical_partial_errors(errors)
+        if not critical_errors:
+            return
+
+        notification_key = self.build_partial_error_notification_key(critical_errors)
+        current_time = time.time()
+        last_sent_at = self._partial_error_notification_times.get(notification_key, 0)
+        if current_time - last_sent_at < self.PARTIAL_ERROR_WEBHOOK_COOLDOWN:
+            remaining = int(self.PARTIAL_ERROR_WEBHOOK_COOLDOWN - (current_time - last_sent_at))
+            self.logger.info(
+                f"Partial error notification throttled for {notification_key} ({remaining}s remaining)"
+            )
+            return
+
+        self._partial_error_notification_times[notification_key] = current_time
+        channel_name = getattr(message.channel, "name", "DM")
+        jump_url = getattr(message, "jump_url", None)
+        error_summary = "; ".join(critical_errors[:3])
+        if len(critical_errors) > 3:
+            error_summary += f" ... and {len(critical_errors) - 3} more"
+
+        await self.send_error_message(
+            "消息部分成功，但关键子任务失败\n"
+            f"Message ID: {message.id}\n"
+            f"Channel: {channel_name}\n"
+            f"Throttle Key: {notification_key}\n"
+            f"Link: {jump_url or 'N/A'}\n"
+            f"Errors: {error_summary}"
+        )
 
     async def process_translated_content(self, message, target_channel):
         """Process specific message content, request translation and retrieve translation result.
@@ -1754,15 +1834,12 @@ class TranslatorBot(commands.Bot):
     async def send_error_message(self, error_message):
         """Send error message to Discord"""
         self.logger.info("Preparing to send error message")
-        
-        # If it's a task error and needs to be restarted
-        if hasattr(self, '_keep_running') and self._keep_running:
-            self.logger.info("Restarting message processing task...")
-            self.message_processor_task = self.loop.create_task(self.process_message_queue())
-            self.message_processor_task.add_done_callback(
-                lambda t: asyncio.create_task(self.handle_queue_processor_error(t, retry_count=0))
-            )
+
         try:
+            error_message = str(error_message)
+            if len(error_message) > 3900:
+                error_message = error_message[:3900] + "\n... (truncated)"
+
             # Create error message
             embed = discord.Embed(
                 title="Translation Error",
@@ -1874,4 +1951,4 @@ def main():
                 break
 
 if __name__ == "__main__":
-    main() 
+    main()

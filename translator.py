@@ -300,8 +300,8 @@ class CustomProvider(BaseProvider):
                 if image_data:
                     b64_image = base64.b64encode(image_data).decode('utf-8')
                     parts.append({
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
                             "data": b64_image
                         }
                     })

@@ -40,6 +40,12 @@ Walmart Papago is a self-hosted, Gemini-powered Discord translation bot that can
 
 ## 📅**Update Log**
 
+### **2026-06-24: Custom Image Request Compatibility & Error Alerts**
+- **Image request compatibility:** Custom API image requests now use the Gemini native REST field format (`inlineData` / `mimeType`), fixing cases where text requests worked but image requests returned permission errors on compatible endpoints.
+- **Partial-success error alerts:** When a message is partially translated but an image sub-task or authentication-related critical sub-task fails, the bot now sends a throttled Webhook alert instead of only writing the failure to logs.
+- **Error notification side-effect fix:** Sending an error notification no longer restarts the message queue. Queue recovery remains handled by the global task error handler.
+- **Notification length protection:** Long error details are truncated before being sent to avoid Discord Embed description length limits.
+
 ### **2026-04-08: Custom Provider Robustness Refactor & Error Collection System**
 - **Authentication Compatibility (Dual-Auth):** Implemented "dual-delivery" authentication (sending the API key in both URL parameters and `x-goog-api-key` headers) to resolve `401 Unauthorized` issues caused by proxy servers that do not forward URL parameters.
 - **Strict Response Validation (Response Guardian):** Introduced strict detection for `text/html` responses. When an API returns a Cloudflare verification page or an HTML error, the bot extracts the HTML title and raises a clear error instead of failing silently with empty content.
