@@ -17,6 +17,12 @@ import time
 from config import PROVIDERS_CONFIG, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAULT_TARGET_LANG, IMAGE_TRANSLATION_PROMPT, EMPTY_INDICATORS, ERROR_WEBHOOK_URL
 
 
+TEXT_API_CALL_TIMEOUT = 45
+IMAGE_API_CALL_TIMEOUT = 60
+TEXT_TRANSLATION_TIMEOUT = 90
+IMAGE_TRANSLATION_TIMEOUT = 150
+
+
 class ModelCooldownError(Exception):
     """Raised when model should enter cooldown (e.g., 503)"""
     pass
@@ -121,7 +127,7 @@ class OfficialProvider(BaseProvider):
         max_retries = min(3, len(available_keys))
         tried_keys = set()
         pending_futures = []  # Futures from timed-out attempts (kept alive via shield)
-        call_timeout = 20 if image_data else 10
+        call_timeout = IMAGE_API_CALL_TIMEOUT if image_data else TEXT_API_CALL_TIMEOUT
         
         for attempt in range(max_retries):
             # Check if any previous timed-out attempt has completed successfully
@@ -317,8 +323,7 @@ class CustomProvider(BaseProvider):
                     }
                 }
                 
-                # Dynamic timeout: 10s for text, 20s for image
-                call_timeout = 20 if image_data else 10
+                call_timeout = IMAGE_API_CALL_TIMEOUT if image_data else TEXT_API_CALL_TIMEOUT
                 req_timeout = aiohttp.ClientTimeout(total=call_timeout)
                 async with aiohttp.ClientSession(timeout=req_timeout) as session:
                     # T5: Disable auto-redirect to detect misconfigured proxies
@@ -755,15 +760,17 @@ class Translator:
                 )
                 raise Exception(f"Translation prompt formatting error: {ke}")
             
-            # Use Manager to execute (60s independent timeout for entire text translation task including all retries)
+            # Use Manager to execute with an independent timeout for all text retries/fallbacks.
             try:
                 result_text = await asyncio.wait_for(
                     self.manager.generate_with_fallback(prompt),
-                    timeout=60
+                    timeout=TEXT_TRANSLATION_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                self.logger.error("Text translation timed out (60s, including all retries)")
-                raise Exception("Text translation timed out (60s)")
+                self.logger.error(
+                    f"Text translation timed out ({TEXT_TRANSLATION_TIMEOUT}s, including all retries)"
+                )
+                raise Exception(f"Text translation timed out ({TEXT_TRANSLATION_TIMEOUT}s)")
             
             if result_text:
                  # Parse the result
@@ -800,15 +807,17 @@ class Translator:
                 image.save(buffer, format='JPEG', quality=95)
                 image_bytes = buffer.getvalue()
                 
-                # 3. Use Manager to execute (90s independent timeout for entire image translation task including all retries)
+                # 3. Use Manager to execute with an independent timeout for all image retries/fallbacks.
                 try:
                     result_text = await asyncio.wait_for(
                         self.manager.generate_with_fallback(prompt, image_data=image_bytes),
-                        timeout=90
+                        timeout=IMAGE_TRANSLATION_TIMEOUT
                     )
                 except asyncio.TimeoutError:
-                    self.logger.error("Image translation timed out (90s, including all retries)")
-                    raise Exception("Image translation timed out (90s)")
+                    self.logger.error(
+                        f"Image translation timed out ({IMAGE_TRANSLATION_TIMEOUT}s, including all retries)"
+                    )
+                    raise Exception(f"Image translation timed out ({IMAGE_TRANSLATION_TIMEOUT}s)")
                 
                 if result_text:
                     return self._parse_translation_response(result_text, is_image=True)
