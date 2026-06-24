@@ -19,12 +19,17 @@ from config import PROVIDERS_CONFIG, SAFETY_SETTINGS, TRANSLATION_PROMPT, DEFAUL
 
 TEXT_API_CALL_TIMEOUT = 45
 IMAGE_API_CALL_TIMEOUT = 60
-TEXT_TRANSLATION_TIMEOUT = 90
+TEXT_TRANSLATION_TIMEOUT = 150
 IMAGE_TRANSLATION_TIMEOUT = 150
 
 
 class ModelCooldownError(Exception):
     """Raised when model should enter cooldown (e.g., 503)"""
+    pass
+
+
+class ModelTimeoutError(Exception):
+    """Raised when a model API call times out and should yield to fallback."""
     pass
 
 
@@ -126,21 +131,9 @@ class OfficialProvider(BaseProvider):
         
         max_retries = min(3, len(available_keys))
         tried_keys = set()
-        pending_futures = []  # Futures from timed-out attempts (kept alive via shield)
         call_timeout = IMAGE_API_CALL_TIMEOUT if image_data else TEXT_API_CALL_TIMEOUT
         
         for attempt in range(max_retries):
-            # Check if any previous timed-out attempt has completed successfully
-            for fut in pending_futures:
-                if fut.done():
-                    try:
-                        response = fut.result()
-                        if response and hasattr(response, 'text') and response.text:
-                            self.logger.info(f"Recovered delayed response from previous attempt for model {model_name}")
-                            return response.text
-                    except Exception:
-                        pass
-            
             remaining = [k for k in available_keys if k not in tried_keys]
             if not remaining:
                 break
@@ -203,9 +196,11 @@ class OfficialProvider(BaseProvider):
                         timeout=call_timeout
                     )
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"API call timed out ({call_timeout}s) for key {key[:8]}... model {model_name}")
-                    pending_futures.append(executor_future)
-                    continue
+                    self.logger.warning(
+                        f"API call timed out ({call_timeout}s) for key {key[:8]}... model {model_name}; "
+                        "skipping remaining keys for this model"
+                    )
+                    raise ModelTimeoutError(f"Model {model_name} API call timed out ({call_timeout}s)")
                 
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
                     self.logger.warning(f"Blocked: {response.prompt_feedback}")
@@ -215,6 +210,8 @@ class OfficialProvider(BaseProvider):
 
             except ModelCooldownError:
                 raise  # Re-raise cooldown errors
+            except ModelTimeoutError:
+                raise  # Re-raise timeout errors so ProviderManager can try the next model/provider
             except Exception as e:
                 error_str = str(e)
                 self.logger.warning(f"Key {key[:8]}... failed ({attempt + 1}/{max_retries}): {error_str}")
@@ -241,21 +238,6 @@ class OfficialProvider(BaseProvider):
                 # Other errors - try next key
                 else:
                     continue
-        
-        # Final chance: wait for any pending timed-out futures (up to 5s)
-        if pending_futures:
-            self.logger.info(f"Waiting up to 5s for {len(pending_futures)} pending API call(s)...")
-            done, _ = await asyncio.wait(pending_futures, timeout=5, return_when=asyncio.FIRST_COMPLETED)
-            for fut in done:
-                try:
-                    response = fut.result()
-                    if response and hasattr(response, 'text') and response.text:
-                        if response.prompt_feedback and response.prompt_feedback.block_reason:
-                            continue
-                        self.logger.info(f"Recovered delayed response for model {model_name}")
-                        return response.text
-                except Exception:
-                    pass
         
         raise Exception(f"All attempted keys failed for provider {self.name}")
 

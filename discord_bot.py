@@ -500,7 +500,7 @@ class TranslatorBot(commands.Bot):
             self._message_cache[message_key] = time.time()
             
             # Fallback timeout protection (600s) to guard against deadlocks.
-            # Actual translation timeouts are managed independently inside translate_text (90s)
+            # Actual translation timeouts are managed independently inside translate_text (150s)
             # and translate_image (150s). Discord send operations are intentionally excluded from timing.
             async def _do_translation():
                 _processed = False
